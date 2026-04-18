@@ -1,0 +1,67 @@
+appId: com.lionlabs.lionclaw
+productName: LionClaw
+copyright: Copyright (c) 2026 LionLabs
+
+directories:
+  output: release
+  buildResources: resources
+
+files:
+  - dist/**/*
+  - "!dist/renderer/src/**"
+  - node_modules/**/*
+  - package.json
+
+extraResources:
+  - from: .lionclaw
+    to: .lionclaw
+    filter:
+      - "**/*"
+      - "!data/**"
+
+mac:
+  icon: resources/icon.icns
+  target:
+    - target: dmg
+      arch:
+        - x64
+        - arm64
+  category: public.app-category.productivity
+  darkModeSupport: true
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  entitlements: resources/entitlements.mac.plist
+  entitlementsInherit: resources/entitlements.mac.plist
+
+dmg:
+  contents:
+    - x: 130
+      y: 220
+    - x: 410
+      y: 220
+      type: link
+      path: /Applications
+
+win:
+  target:
+    - target: nsis
+      arch:
+        - x64
+  publisherName: LionLabs
+
+nsis:
+  oneClick: true
+  perMachine: false
+  allowToChangeInstallationDirectory: false
+  deleteAppDataOnUninstall: false
+
+asar: true
+
+asarUnpack:
+  - "**/*.node"
+  - "**/better-sqlite3/**"
+  - "**/keytar/**"
+  - "**/sqlite-vec/**"
+
+electronDownload:
+  cache: .cache/electron
