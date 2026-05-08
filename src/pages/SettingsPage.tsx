@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { Save, CheckCircle, RotateCcw, KeyRound, Volume2, Cpu, BrainCircuit } from 'lucide-react';
 import { VoiceSelector } from '@/components/settings/VoiceSelector';
 import { GoogleOAuthSetup } from '@/components/settings/GoogleOAuthSetup';
+import { CodexSection } from '@/components/settings/CodexSection';
 import { useAuthStore } from '@/stores/auth-store';
 import { useAppStore } from '@/stores/app-store';
 import { useChatStore } from '@/stores/chat-store';
@@ -142,6 +143,9 @@ export function SettingsPage() {
 
         {/* Ollama (Local Models) */}
         <OllamaSettings settings={settings} onChange={setSettings} />
+
+        {/* Codex CLI */}
+        <CodexSection />
 
         {/* Memory Graph */}
         <MgraphSettings settings={settings} onChange={setSettings} onSave={handleSave} />

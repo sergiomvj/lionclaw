@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Loader2, Wrench, CheckCircle2, ChevronDown, ChevronRight, AlertCircle, RefreshCw, XCircle } from 'lucide-react';
 import { usePipelineStore } from '@/stores/pipeline-store';
+import { useActiveProjectState } from '@/hooks/useActiveProjectState';
 
 // ---- Helper: format a tool input for display ----
 
@@ -234,8 +235,12 @@ interface PipelineStreamViewProps {
 const MAX_RETRIES = 3;
 
 export function PipelineStreamView({ phaseName, nextPhaseName }: PipelineStreamViewProps) {
-  const { streamContent, currentToolCalls, isStreaming, error, retryPhase, abortPipeline } =
-    usePipelineStore();
+  const streamContent = useActiveProjectState(s => s.streamContent) ?? '';
+  const currentToolCalls = useActiveProjectState(s => s.currentToolCalls) ?? [];
+  const isStreaming = useActiveProjectState(s => s.isStreaming) ?? false;
+  const error = useActiveProjectState(s => s.error) ?? null;
+  const retryPhase = usePipelineStore(s => s.retryPhase);
+  const abortPipeline = usePipelineStore(s => s.abortPipeline);
 
   const bottomRef = useRef<HTMLDivElement>(null);
 

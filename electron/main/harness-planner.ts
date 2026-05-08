@@ -1,8 +1,15 @@
 import fs from 'fs';
 import path from 'path';
+import { jsonrepair } from 'jsonrepair';
 import { createLogger } from './logger';
+import { extractBalancedJsonObjectCandidates, unwrapKnownJsonWrappers } from './json-extractor';
 import { insertHarnessSprint, getAllAgents } from './db';
 import type { AgentConfig, HarnessProject } from '../../src/types';
+import {
+  findLegacyHarnessSprintsPath,
+  resolveHarnessSprintsPath,
+  resolveHarnessSprintsReadPath,
+} from './pipeline-paths';
 
 const logger = createLogger('harness-planner');
 
@@ -154,48 +161,88 @@ Responda com JSON puro no seguinte schema (preencha com os dados reais das sprin
 /**
  * Parse and validate the Planner's JSON output against the expected schema.
  * Extracts JSON from the output text (handles cases where the agent wraps in markdown or free text).
+ *
+ * @param rawOutput - Raw text from the planner agent.
+ * @param outMeta   - Optional out-param; sets `repaired = true` if jsonrepair was used.
+ * @param validAgentIds - When provided, validates coder_agent_id and evaluator_agent_id fields.
  */
-export function parsePlannerOutput(rawOutput: string): SprintsJson {
-  // Try to extract JSON from the output
-  let jsonStr = rawOutput.trim();
-
-  // Handle markdown code blocks
-  const jsonBlockMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
-  if (jsonBlockMatch) {
-    jsonStr = jsonBlockMatch[1].trim();
-  }
-
-  // Try to find the outermost JSON object by matching balanced braces
-  const firstBrace = jsonStr.indexOf('{');
-  if (firstBrace !== -1) {
-    let depth = 0;
-    let lastBrace = -1;
-    for (let i = firstBrace; i < jsonStr.length; i++) {
-      if (jsonStr[i] === '{') depth++;
-      else if (jsonStr[i] === '}') {
-        depth--;
-        if (depth === 0) { lastBrace = i; break; }
-      }
-    }
-    if (lastBrace !== -1) {
-      jsonStr = jsonStr.slice(firstBrace, lastBrace + 1);
-    }
-  }
-
-  // If no JSON object found at all, give a clear error
-  if (!jsonStr.startsWith('{')) {
+export function parsePlannerOutput(
+  rawOutput: string,
+  outMeta?: { repaired?: boolean },
+  validAgentIds?: { coderIds: Set<string>; evaluatorIds: Set<string> },
+): SprintsJson {
+  // Extract all top-level balanced JSON object candidates from the raw output.
+  // Iterating last-to-first because models often emit explanatory text first and
+  // the actual JSON payload last (the final candidate is the most likely winner).
+  const candidates = extractBalancedJsonObjectCandidates(rawOutput);
+  if (candidates.length === 0) {
     const preview = rawOutput.slice(0, 200).replace(/\n/g, ' ');
     throw new Error(
       `Planner nao retornou JSON valido. Inicio da resposta: "${preview}..."`,
     );
   }
 
-  const parsed = JSON.parse(jsonStr) as SprintsJson;
+  let parsed: SprintsJson | null = null;
+  let lastCandidateError: Error | null = null;
 
-  // Validate required fields
-  if (!parsed.project) throw new Error('Missing "project" in planner output');
-  if (!Array.isArray(parsed.sprints)) throw new Error('Missing "sprints" array in planner output');
-  if (parsed.sprints.length === 0) throw new Error('Planner generated 0 sprints');
+  for (let ci = candidates.length - 1; ci >= 0; ci--) {
+    const candidate = candidates[ci]!;
+    let parsedRaw: unknown;
+    try {
+      parsedRaw = JSON.parse(candidate);
+    } catch (e1) {
+      try {
+        const repaired = jsonrepair(candidate);
+        parsedRaw = JSON.parse(repaired);
+        if (outMeta) outMeta.repaired = true;
+        logger.warn(
+          { originalError: (e1 as Error).message, candidateIndex: ci },
+          'Planner JSON parsed via jsonrepair (fallback)',
+        );
+      } catch (repairErr) {
+        lastCandidateError = new Error(
+          `Planner output is not valid JSON. ` +
+          `Original error: ${(e1 as Error).message}. ` +
+          `Repair error: ${(repairErr as Error).message}. ` +
+          `Candidate (first 200 chars): ${candidate.slice(0, 200)}`,
+        );
+        continue;
+      }
+    }
+
+    // Unwrap known single-key wrappers: { "plan": {...} }, { "data": {...} }, etc.
+    const unwrapped = unwrapKnownJsonWrappers(parsedRaw);
+    const candidate_parsed = unwrapped as SprintsJson;
+
+    // Quick structural check: must have project + non-empty sprints array
+    if (!candidate_parsed?.project) {
+      lastCandidateError = new Error(
+        `Missing "project" in planner output (candidate index ${ci}).`,
+      );
+      continue;
+    }
+    if (!Array.isArray(candidate_parsed.sprints)) {
+      lastCandidateError = new Error(
+        `Missing "sprints" array in planner output (candidate index ${ci}).`,
+      );
+      continue;
+    }
+    if (candidate_parsed.sprints.length === 0) {
+      lastCandidateError = new Error(
+        `Planner generated 0 sprints (candidate index ${ci}).`,
+      );
+      continue;
+    }
+    parsed = candidate_parsed;
+    break;
+  }
+
+  if (!parsed) {
+    const preview = rawOutput.slice(0, 200).replace(/\n/g, ' ');
+    throw lastCandidateError ?? new Error(
+      `Planner nao retornou JSON valido com project + sprints. Inicio: "${preview}..."`,
+    );
+  }
 
   // Validate each sprint
   for (const sprint of parsed.sprints) {
@@ -208,6 +255,39 @@ export function parsePlannerOutput(rawOutput: string): SprintsJson {
       if (!Array.isArray(feature.acceptance_criteria)) {
         throw new Error(`Feature "${feature.id}" missing "acceptance_criteria"`);
       }
+    }
+
+    // Validate agent IDs when registry is provided
+    if (validAgentIds) {
+      if (sprint.coder_agent_id && !validAgentIds.coderIds.has(sprint.coder_agent_id)) {
+        const validList = Array.from(validAgentIds.coderIds).join(', ');
+        throw new Error(
+          `Sprint "${sprint.id}" has invalid coder_agent_id "${sprint.coder_agent_id}". ` +
+          `Valid IDs: ${validList}`,
+        );
+      }
+      if (
+        'evaluator_agent_id' in sprint &&
+        (sprint as Record<string, unknown>)['evaluator_agent_id'] &&
+        !validAgentIds.evaluatorIds.has((sprint as Record<string, unknown>)['evaluator_agent_id'] as string)
+      ) {
+        const validList = Array.from(validAgentIds.evaluatorIds).join(', ');
+        throw new Error(
+          `Sprint "${sprint.id}" has invalid evaluator_agent_id "${(sprint as Record<string, unknown>)['evaluator_agent_id'] as string}". ` +
+          `Valid IDs: ${validList}`,
+        );
+      }
+    }
+  }
+
+  // Validate project-level evaluator_agent_id when registry is provided
+  if (validAgentIds && parsed.project?.config?.evaluator_agent_id) {
+    if (!validAgentIds.evaluatorIds.has(parsed.project.config.evaluator_agent_id)) {
+      const validList = Array.from(validAgentIds.evaluatorIds).join(', ');
+      throw new Error(
+        `project.config.evaluator_agent_id "${parsed.project.config.evaluator_agent_id}" is not a valid evaluator. ` +
+        `Valid IDs: ${validList}`,
+      );
     }
   }
 
@@ -550,17 +630,22 @@ export function getNextSprintsVersion(projectDir: string): number {
  */
 export function saveSprintsJson(
   projectId: string,
-  projectDir: string,
+  sprintsJsonPath: string,
   sprintsJson: SprintsJson,
   evaluatorAgentId: string,
   format: 'json' | 'markdown' = 'json',
 ): { path: string; version: number } {
+  const canonicalJsonPath = path.resolve(sprintsJsonPath);
+  const projectDir = path.dirname(canonicalJsonPath);
   const version = getNextSprintsVersion(projectDir);
   sprintsJson.metadata.version = version;
 
   fs.mkdirSync(projectDir, { recursive: true });
 
-  // Always save .json (the engine and frontend need it for structured access)
+  // Always save the canonical JSON that agents edit and the UI reads.
+  fs.writeFileSync(canonicalJsonPath, JSON.stringify(sprintsJson, null, 2), 'utf-8');
+
+  // Keep a versioned JSON history in the same project-owned directory.
   const jsonFilename = `sprints.v${version}.json`;
   const jsonPath = path.join(projectDir, jsonFilename);
   fs.writeFileSync(jsonPath, JSON.stringify(sprintsJson, null, 2), 'utf-8');
@@ -587,7 +672,7 @@ export function saveSprintsJson(
 
   logger.info({ projectId, version, format, sprintCount: sprintsJson.sprints.length }, 'Saved sprints');
 
-  return { path: jsonPath, version };
+  return { path: canonicalJsonPath, version };
 }
 
 /**
@@ -650,7 +735,22 @@ ${feedback}`;
  * Read the latest sprints.json for a project directory.
  * Returns the parsed SprintsJson or null if none exists.
  */
-export function readLatestSprintsJson(projectDir: string): SprintsJson | null {
+export function readSprintsJsonFile(filePath: string): SprintsJson | null {
+  if (!fs.existsSync(filePath)) return null;
+  const content = fs.readFileSync(filePath, 'utf-8');
+  return JSON.parse(content) as SprintsJson;
+}
+
+export function readLatestSprintsJson(projectDir: string, canonicalPath?: string | null): SprintsJson | null {
+  if (canonicalPath) {
+    const canonicalJson = readSprintsJsonFile(canonicalPath);
+    if (canonicalJson) return canonicalJson;
+  }
+
+  const unversionedPath = path.join(projectDir, 'sprints.json');
+  const unversionedJson = readSprintsJsonFile(unversionedPath);
+  if (unversionedJson) return unversionedJson;
+
   if (!fs.existsSync(projectDir)) return null;
 
   const files = fs.readdirSync(projectDir).filter(f => f.match(/^sprints\.v\d+\.json$/));
@@ -666,6 +766,25 @@ export function readLatestSprintsJson(projectDir: string): SprintsJson | null {
 
   const content = fs.readFileSync(path.join(projectDir, latest.file), 'utf-8');
   return JSON.parse(content) as SprintsJson;
+}
+
+export function readHarnessSprintsJson(project: HarnessProject): SprintsJson | null {
+  const readPath = resolveHarnessSprintsReadPath(project);
+  const canonicalJson = readSprintsJsonFile(readPath);
+  if (canonicalJson) return canonicalJson;
+
+  const canonicalPath = resolveHarnessSprintsPath(project);
+  if (canonicalPath !== readPath) {
+    const fallbackCanonicalJson = readSprintsJsonFile(canonicalPath);
+    if (fallbackCanonicalJson) return fallbackCanonicalJson;
+  }
+
+  const legacyPath = findLegacyHarnessSprintsPath(project);
+  if (legacyPath) {
+    return readLatestSprintsJson(path.dirname(legacyPath), legacyPath);
+  }
+
+  return readLatestSprintsJson(path.dirname(canonicalPath), canonicalPath);
 }
 
 export { getAllAgents };

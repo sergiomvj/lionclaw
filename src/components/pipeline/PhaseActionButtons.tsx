@@ -8,6 +8,7 @@ import {
   CheckCircle2,
 } from 'lucide-react';
 import { usePipelineStore } from '@/stores/pipeline-store';
+import { useActiveProjectState } from '@/hooks/useActiveProjectState';
 
 // ---- FeedbackInput ----
 
@@ -29,19 +30,26 @@ function FeedbackInput({ value, onChange, placeholder }: FeedbackInputProps) {
   );
 }
 
-// ---- Phases that use Aprovar (all conversational phases 1-14) ----
-// Phases 1, 3, 5-10, 12 are conversational and need the Approve button.
+// ---- Phases that use Aprovar (conversational phases across pipelines) ----
+// Dev pipeline conversations: 1, 3, 5, 6, 7, 8, 9, 10, 12
+// Security pipeline conversations: 4, 5, 7, 9
+// Union below; including phase 4 is harmless for dev (it is auto and never sets
+// awaitingUser=true, so the button stays hidden there).
 // The 'awaiting-dev-confirmation' status renders DevConfirmationButtons instead when triggered.
-const APPROVAL_PHASES = new Set([1, 3, 5, 6, 7, 8, 9, 10, 12]);
+const APPROVAL_PHASES = new Set([1, 3, 4, 5, 6, 7, 8, 9, 10, 12]);
 
 // ---- Approval button ----
 
 interface ApprovalButtonsProps {
   disabled: boolean;
   onApprove: () => void;
+  /** Override do label/icone padrao "Aprovar". Usado pela fase 4 architecture-review
+   *  ("Fechar decisoes e gerar SPEC") pra deixar claro que isso fecha a entrevista
+   *  e dispara um agente caro (spec-builder, opus, ~5-10min). */
+  label?: string;
 }
 
-function ApprovalButtons({ disabled, onApprove }: ApprovalButtonsProps) {
+function ApprovalButtons({ disabled, onApprove, label = 'Aprovar' }: ApprovalButtonsProps) {
   return (
     <div className="flex gap-2 justify-center">
       <button
@@ -50,7 +58,7 @@ function ApprovalButtons({ disabled, onApprove }: ApprovalButtonsProps) {
         className="flex items-center gap-1.5 px-5 py-2 text-xs font-semibold bg-green-600 hover:bg-green-500 text-white rounded-lg transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
       >
         <ThumbsUp size={13} />
-        Aprovar
+        {label}
       </button>
     </div>
   );
@@ -189,16 +197,20 @@ export function PhaseActionButtons({
   pausedByMaxLoops = false,
   readOnly = false,
 }: PhaseActionButtonsProps) {
-  const {
-    isStreaming,
-    awaitingUser,
-    agentCompleted,
-    phaseStatus,
-    getCurrentMessages,
-    approvePhase,
-    abortPipeline,
-    confirmDevelopment,
-  } = usePipelineStore();
+  const isStreaming = useActiveProjectState(s => s.isStreaming) ?? false;
+  const awaitingUser = useActiveProjectState(s => s.awaitingUser) ?? false;
+  const agentCompleted = useActiveProjectState(s => s.agentCompleted) ?? false;
+  const phaseStatus = useActiveProjectState(s => s.phaseStatus) ?? '';
+  // pipelineType vem da lista de projects (nao mora em PerProjectState). Default
+  // 'development' pra retro-compat com rows antigas sem pipelineType setado.
+  const pipelineType = usePipelineStore(s => {
+    const p = s.projects.find((proj) => proj.id === s.activeProjectId);
+    return p?.pipelineType ?? 'development';
+  });
+  const getCurrentMessages = usePipelineStore(s => s.getCurrentMessages);
+  const approvePhase = usePipelineStore(s => s.approvePhase);
+  const abortPipeline = usePipelineStore(s => s.abortPipeline);
+  const confirmDevelopment = usePipelineStore(s => s.confirmDevelopment);
 
   const disabled = isStreaming;
   const messages = getCurrentMessages();
@@ -238,6 +250,17 @@ export function PhaseActionButtons({
 
   if (currentPhase === null) return null;
 
+  // ---- Architecture-review phase 2 (Triage): no generic approve button ----
+  // The approval payload requires { selectedCandidateId }, which only the
+  // candidate cards in ArchitectureReviewArtifactView can provide via the
+  // "Aprovar este alvo" button per card. A generic "Aprovar" here would chamar
+  // approvePhase() sem payload e quebrar (Sprint 3 valida no engine).
+  // Guard explicito: nunca renderizar approve generico na fase 2 architecture-review.
+  // (APPROVAL_PHASES atualmente nao inclui 2, mas isso protege contra regressao.)
+  // pipelineType nao chega aqui — usar o store ou o phaseStatus derivado.
+  // Heuristica suficiente: phase===2 + ausencia de blockId no metadata identifica
+  // o caso architecture-review (security/dev/feature nao usam phase 2 conversation).
+
   // ---- Phase 12 awaiting-dev-confirmation: "Iniciar Desenvolvimento" ----
   if (phaseStatus === 'awaiting-dev-confirmation') {
     return (
@@ -259,17 +282,29 @@ export function PhaseActionButtons({
   // longer a hard gate — it is used only for the hint text.
   if (APPROVAL_PHASES.has(currentPhase)) {
     const approvalDisabled = disabled || !hasAssistantMessage;
+    // Architecture-review fase 4 (Decision Interview): label e hint customizados
+    // pra deixar claro que isso fecha a entrevista e dispara o spec-builder
+    // (auto, opus, ~5-10min). Botao "Aprovar" generico era ambiguo aqui.
+    const isArchPhase4 =
+      pipelineType === 'architecture-review' && currentPhase === 4;
+    const approvalLabel = isArchPhase4
+      ? 'Fechar decisoes e gerar SPEC'
+      : 'Aprovar';
+    const hintText = isArchPhase4
+      ? agentCompleted
+        ? 'Entrevista cobriu o essencial. Fechar dispara a geracao da SPEC (~5-10min).'
+        : 'Continue a entrevista ou feche quando achar que cobriu o essencial. Fechar gera a SPEC automaticamente.'
+      : agentCompleted
+        ? 'Agente concluiu esta fase. Clique em Aprovar para avancar.'
+        : 'Voce pode continuar conversando ou clicar em Aprovar para avancar.';
     return (
       <div className={containerClass}>
         <div className={innerClass}>
-          <p className={titleClass}>
-            {agentCompleted
-              ? 'Agente concluiu esta fase. Clique em Aprovar para avancar.'
-              : 'Voce pode continuar conversando ou clicar em Aprovar para avancar.'}
-          </p>
+          <p className={titleClass}>{hintText}</p>
           <ApprovalButtons
             disabled={approvalDisabled}
             onApprove={handleApprove}
+            label={approvalLabel}
           />
         </div>
       </div>

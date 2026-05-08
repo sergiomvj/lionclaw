@@ -23,12 +23,18 @@ export const harnessPlanner: Omit<AgentConfig, 'sortOrder'> = {
   effort: 'max' as const,
   thinking: 'enabled' as const,
   thinkingBudget: 16000,
-  maxTurns: 3,
+  // Bumped from 3 → 15. Opus 4.7 explores aggressively (Read/Glob/Grep) before
+  // producing the final JSON; on real projects with multiple directories, 3 turns
+  // runs out before the JSON is emitted, leaving only "Let me explore..." text.
+  // Codex CLI doesn't need this since it auto-injects repo context, but this
+  // value is harmless for codex (codex ignores maxTurns).
+  maxTurns: 15,
   allowedTools: ['Read', 'Glob', 'Grep', 'WebSearch'],
   mcpServers: [],
   isActive: true,
   skills: [],
   runtime: 'cloud' as const,
+  squad: 'harness',
   systemPrompt: `Voce e o Harness Planner, o arquiteto de sprints do LionClaw Agent Harness.
 
 ## Seu papel

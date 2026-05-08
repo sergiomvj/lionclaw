@@ -4,11 +4,21 @@ import fs from 'fs';
 import * as sqliteVec from 'sqlite-vec';
 import { createLogger } from './logger';
 import { getLionClawHome } from './paths';
-import { HARNESS_SEED_AGENTS, harnessPlanner, harnessCoder, harnessEvaluator, WORKFLOW_SEED_AGENTS, ENRICH_SEED_AGENTS, DEV_SEED_AGENTS, skillCreator, SKILL_CREATOR_ID, PIPELINE_SEED_AGENTS, TECH_SEED_AGENTS } from './seed-agents';
+import { migrateLegacyHarnessSprintsJsonFile } from './pipeline-paths';
+import { harnessPlanner, harnessCoder, harnessEvaluator, skillCreator } from './seed-agents';
+import { applyMigrationV50 } from './db-migrations/v50-prompts';
+import { applyMigrationV53 } from './db-migrations/v53-architecture-review';
+import { applyMigrationV54 } from './db-migrations/v54-triage-meta-exclusions';
+import { applyMigrationV55 } from './db-migrations/v55-architecture-mapper-layers';
+import { applyMigrationV56 } from './db-migrations/v56-interviewer-strict-format';
+import { applyMigrationV57 } from './db-migrations/v57-drop-token-usage';
 import type {
   ChatMessage,
   ChatSession,
   AgentConfig,
+  ExternalConfig,
+  CodexConfig,
+  CostSource,
   AuditEntry,
   LogFilters,
   MCPServerConfig,
@@ -18,9 +28,9 @@ import type {
   HarnessRound,
   HarnessProjectMetrics,
   SprintMetrics,
-  WorkflowRun,
   IngestJob,
 } from '../../src/types';
+import type { PipelineType, RoundDetail, SecuritySummary } from '../../src/types/pipeline';
 
 const logger = createLogger('db');
 
@@ -50,6 +60,7 @@ export function initDatabase(): void {
   sqliteVec.load(db);
 
   runMigrations();
+  migrateLegacyHarnessSprintsJsonPaths();
   fixVecTableIfNeeded();
   logger.info({ path: dbPath }, 'Database ready');
 }
@@ -352,6 +363,119 @@ function runMigrations(): void {
     db.exec(MIGRATION_V40_RECONCILE_LEGACY_SESSION_TYPES);
     db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(40);
     logger.info('Applied migration v40 - reconcile legacy scheduler/telegram sessions with type=chat');
+  }
+
+  if (currentVersion < 41) {
+    db.exec(MIGRATION_V41_SECURITY_PIPELINE);
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(41);
+    logger.info('Applied migration v41 - pipeline_type column and security_agent_status table');
+  }
+
+  if (currentVersion < 42) {
+    db.exec(MIGRATION_V42_SECURITY_SUMMARY);
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(42);
+    logger.info('Applied migration v42 - security_summary_json column on harness_projects');
+  }
+
+  if (currentVersion < 43) {
+    db.pragma('foreign_keys = OFF');
+    db.exec(MIGRATION_V43);
+    db.pragma('foreign_keys = ON');
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(43);
+    logger.info('Applied migration v43 - external runtime + external_config column');
+  }
+
+  if (currentVersion < 44) {
+    db.exec(MIGRATION_V44);
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(44);
+    logger.info('Applied migration v44 - cost source + runtime/provider/model snapshot');
+  }
+
+  if (currentVersion < 45) {
+    db.exec(MIGRATION_V45);
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(45);
+    logger.info('Applied migration v45 - pipeline_docs_id column on harness_projects');
+  }
+
+  if (currentVersion < 46) {
+    db.exec(MIGRATION_V46);
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(46);
+    logger.info('Applied migration v46 - metadata column on harness_rounds');
+  }
+
+  if (currentVersion < 47) {
+    db.pragma('foreign_keys = OFF');
+    db.exec(MIGRATION_V47);
+    db.pragma('foreign_keys = ON');
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(47);
+    logger.info('Applied migration v47 - codex runtime + codex_config column on agents');
+  }
+
+  // P1.6: guard idempotente por schema real. Se schema_version>=48 vier de uma
+  // branch onde V48 significava outra coisa (drift), o CHECK pode estar sem
+  // 'aborted'/'interrupted'. O helper aplica a migration baseado no SCHEMA REAL,
+  // nao em schema_version. Se a coluna ja aceita os estados, no-op.
+  // FK off/on: harness_sprints/harness_rounds reference harness_projects(id);
+  // recreating the parent table invalidaria FK pointers mid-DDL — o helper trata.
+  ensureHarnessProjectStatusCheckExpanded(db);
+  if (currentVersion < 48) {
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(48);
+    logger.info('Applied migration v48 - expand harness_projects.status CHECK to include aborted/interrupted');
+  }
+
+  if (currentVersion < 49) {
+    db.exec(MIGRATION_V49_FIX_AGENT_SQUADS);
+    applyMigrationV49Tools(db);
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(49);
+    logger.info('Applied migration v49 - fix agent squads + secrets-scanner tools');
+  }
+
+  if (currentVersion < 50) {
+    applyMigrationV50(db);
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(50);
+    logger.info('Applied migration v50 - update spec-builder/validator/security-skeptic prompts');
+  }
+
+  if (currentVersion < 51) {
+    db.exec(MIGRATION_V51);
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(51);
+    logger.info('Applied migration v51 - codex_windows_prep_consent + codex_patch_failures column');
+  }
+
+  if (currentVersion < 52) {
+    applyMigrationV52TechWriteRemoval(db);
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(52);
+    logger.info('Applied migration v52 - remove Write tool from feat-tech-* and tech-* agents');
+  }
+
+  if (currentVersion < 53) {
+    applyMigrationV53(db);
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(53);
+    logger.info('Applied migration v53 - architecture-review pipeline seed agents');
+  }
+
+  if (currentVersion < 54) {
+    applyMigrationV54(db);
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(54);
+    logger.info('Applied migration v54 - architecture-target-triage meta exclusions (CLAUDE.md, docs/)');
+  }
+
+  if (currentVersion < 55) {
+    applyMigrationV55(db);
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(55);
+    logger.info('Applied migration v55 - architecture-mapper layer/kind schema fields');
+  }
+
+  if (currentVersion < 56) {
+    applyMigrationV56(db);
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(56);
+    logger.info('Applied migration v56 - architecture-decision-interviewer strict format labels');
+  }
+
+  if (currentVersion < 57) {
+    applyMigrationV57(db);
+    db.prepare('INSERT INTO schema_version (version) VALUES (?)').run(57);
+    logger.info('Applied migration v57 - drop token_usage table (UsagePage replaced by CodeBurn embed)');
   }
 }
 
@@ -1077,6 +1201,360 @@ const MIGRATION_V40_RECONCILE_LEGACY_SESSION_TYPES = `
     AND task_id IS NULL;
 `;
 
+const MIGRATION_V41_SECURITY_PIPELINE = `
+  ALTER TABLE harness_projects ADD COLUMN pipeline_type TEXT NOT NULL DEFAULT 'development';
+
+  CREATE TABLE IF NOT EXISTS security_agent_status (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id TEXT NOT NULL REFERENCES harness_projects(id) ON DELETE CASCADE,
+    agent_id TEXT NOT NULL,
+    agent_name TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    findings_count INTEGER DEFAULT 0,
+    output_file TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    error_message TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_security_agent_status_project ON security_agent_status(project_id);
+`;
+
+const MIGRATION_V42_SECURITY_SUMMARY = `
+  ALTER TABLE harness_projects ADD COLUMN security_summary_json TEXT DEFAULT NULL;
+`;
+
+// V43: Add external runtime support to agents table.
+// SQLite does not support ALTER TABLE ... ADD CONSTRAINT, so the table is recreated
+// using the same pattern as V35 to update the runtime CHECK constraint.
+// The external_config column (nullable JSON) is added for the new runtime path.
+const MIGRATION_V43 = `
+  CREATE TABLE agents_new (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    system_prompt TEXT DEFAULT '',
+    model TEXT DEFAULT 'sonnet',
+    allowed_tools TEXT DEFAULT '[]',
+    mcp_servers TEXT DEFAULT '[]',
+    is_active INTEGER DEFAULT 1,
+    sort_order INTEGER DEFAULT 0,
+    effort TEXT DEFAULT 'medium',
+    thinking TEXT DEFAULT 'adaptive',
+    thinking_budget INTEGER,
+    max_turns INTEGER,
+    skills TEXT DEFAULT '[]',
+    kb_enabled INTEGER NOT NULL DEFAULT 1,
+    runtime TEXT DEFAULT 'cloud'
+      CHECK (runtime IN ('cloud', 'local', 'external')),
+    local_config TEXT DEFAULT NULL,
+    external_config TEXT DEFAULT NULL,
+    local_mode TEXT DEFAULT 'simple',
+    max_tool_rounds INTEGER DEFAULT 5,
+    squad TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  INSERT INTO agents_new (
+    id, name, description, system_prompt, model, allowed_tools, mcp_servers,
+    is_active, sort_order, effort, thinking, thinking_budget, max_turns,
+    skills, kb_enabled, runtime, local_config, local_mode, max_tool_rounds, squad,
+    created_at, updated_at
+  )
+  SELECT
+    id, name, description, system_prompt, model, allowed_tools, mcp_servers,
+    is_active, sort_order, effort, thinking, thinking_budget, max_turns,
+    skills, kb_enabled, runtime, local_config, local_mode, max_tool_rounds, squad,
+    created_at, updated_at
+  FROM agents;
+
+  DROP TABLE agents;
+  ALTER TABLE agents_new RENAME TO agents;
+`;
+
+// V44: Add cost source tracking and runtime/provider/model snapshots to harness_rounds.
+// All 4 columns are nullable so existing rows remain valid (they will have NULL values).
+const MIGRATION_V44 = `
+  ALTER TABLE harness_rounds ADD COLUMN cost_source TEXT;
+  ALTER TABLE harness_rounds ADD COLUMN runtime_used TEXT;
+  ALTER TABLE harness_rounds ADD COLUMN provider_used TEXT;
+  ALTER TABLE harness_rounds ADD COLUMN model_used TEXT;
+`;
+
+// V45: Add pipeline_docs_id to harness_projects for document organization per pipeline run.
+const MIGRATION_V45 = `
+  ALTER TABLE harness_projects ADD COLUMN pipeline_docs_id TEXT DEFAULT NULL;
+`;
+
+// V46: Add metadata JSON column to harness_rounds for telemetry (e.g. evaluatorParseTier).
+const MIGRATION_V46 = `
+  ALTER TABLE harness_rounds ADD COLUMN metadata TEXT DEFAULT '{}';
+`;
+
+// V47: Add runtime 'codex' support to agents table.
+// SQLite does not support ALTER TABLE ... ADD CONSTRAINT, so the table is recreated
+// using the same pattern as V43 to update the runtime CHECK constraint.
+// The codex_config column (nullable JSON) is added for the new runtime path.
+const MIGRATION_V47 = `
+  CREATE TABLE agents_new (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    description TEXT DEFAULT '',
+    system_prompt TEXT DEFAULT '',
+    model TEXT DEFAULT 'sonnet',
+    allowed_tools TEXT DEFAULT '[]',
+    mcp_servers TEXT DEFAULT '[]',
+    is_active INTEGER DEFAULT 1,
+    sort_order INTEGER DEFAULT 0,
+    effort TEXT DEFAULT 'medium',
+    thinking TEXT DEFAULT 'adaptive',
+    thinking_budget INTEGER,
+    max_turns INTEGER,
+    skills TEXT DEFAULT '[]',
+    kb_enabled INTEGER NOT NULL DEFAULT 1,
+    runtime TEXT DEFAULT 'cloud'
+      CHECK (runtime IN ('cloud', 'local', 'external', 'codex')),
+    local_config TEXT DEFAULT NULL,
+    external_config TEXT DEFAULT NULL,
+    codex_config TEXT DEFAULT NULL,
+    local_mode TEXT DEFAULT 'simple',
+    max_tool_rounds INTEGER DEFAULT 5,
+    squad TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  INSERT INTO agents_new (
+    id, name, description, system_prompt, model, allowed_tools, mcp_servers,
+    is_active, sort_order, effort, thinking, thinking_budget, max_turns,
+    skills, kb_enabled, runtime, local_config, external_config, local_mode,
+    max_tool_rounds, squad, created_at, updated_at,
+    codex_config
+  )
+  SELECT
+    id, name, description, system_prompt, model, allowed_tools, mcp_servers,
+    is_active, sort_order, effort, thinking, thinking_budget, max_turns,
+    skills, kb_enabled, runtime, local_config, external_config, local_mode,
+    max_tool_rounds, squad, created_at, updated_at,
+    NULL AS codex_config
+  FROM agents;
+
+  DROP TABLE agents;
+  ALTER TABLE agents_new RENAME TO agents;
+`;
+
+// V48: Expand harness_projects.status CHECK constraint to include
+// 'aborted' and 'interrupted'.
+//
+// Why: pre-V48, the only "stop" statuses persisted were 'paused' and 'failed'.
+// recoverInterruptedPipelines (boot crash recovery) wrote 'paused' to the DB
+// but emitted 'interrupted' over IPC — a gambiarra. Similarly, abortPipeline
+// persisted 'failed' even though the abort was an explicit user action, not
+// an actual failure. Post-V48, the persisted status equals the truth: aborted
+// means user-aborted, interrupted means crash-recovered.
+//
+// SQLite cannot ALTER CHECK constraints, so the table is recreated. All 27
+// existing columns (V37 base + V41 pipeline_type + V42 security_summary_json
+// + V45 pipeline_docs_id) are preserved verbatim.
+const MIGRATION_V48_EXPAND_PROJECT_STATUS_CHECK = `
+  CREATE TABLE harness_projects_v48 (
+    id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
+    name TEXT NOT NULL,
+    description TEXT,
+    project_path TEXT NOT NULL,
+    spec_path TEXT NOT NULL,
+    sprints_json_path TEXT,
+    status TEXT NOT NULL DEFAULT 'idle'
+      CHECK (status IN (
+        'idle', 'planning', 'reviewing', 'ready',
+        'running', 'paused', 'done', 'failed',
+        'aborted', 'interrupted'
+      )),
+    config TEXT NOT NULL DEFAULT '{}',
+    current_sprint_index INTEGER DEFAULT -1,
+    total_sprints INTEGER DEFAULT 0,
+    total_features INTEGER DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    planner_input_tokens INTEGER DEFAULT 0,
+    planner_output_tokens INTEGER DEFAULT 0,
+    planner_cache_tokens INTEGER DEFAULT 0,
+    planner_cost_usd REAL DEFAULT 0,
+    planner_duration_ms INTEGER DEFAULT 0,
+    pipeline_start_phase INTEGER DEFAULT NULL,
+    pipeline_current_phase INTEGER DEFAULT NULL,
+    discovery_notes_path TEXT DEFAULT NULL,
+    prd_path TEXT DEFAULT NULL,
+    pipeline_sprint_index INTEGER DEFAULT 0,
+    pipeline_discovery_block INTEGER DEFAULT 1,
+    pipeline_type TEXT NOT NULL DEFAULT 'development',
+    security_summary_json TEXT DEFAULT NULL,
+    pipeline_docs_id TEXT DEFAULT NULL
+  );
+
+  INSERT INTO harness_projects_v48
+    SELECT
+      id, name, description, project_path, spec_path, sprints_json_path,
+      status, config, current_sprint_index, total_sprints, total_features,
+      created_at, updated_at,
+      planner_input_tokens, planner_output_tokens, planner_cache_tokens,
+      planner_cost_usd, planner_duration_ms,
+      pipeline_start_phase, pipeline_current_phase,
+      discovery_notes_path, prd_path,
+      pipeline_sprint_index, pipeline_discovery_block,
+      pipeline_type, security_summary_json, pipeline_docs_id
+    FROM harness_projects;
+
+  DROP TABLE harness_projects;
+  ALTER TABLE harness_projects_v48 RENAME TO harness_projects;
+
+  CREATE INDEX IF NOT EXISTS idx_harness_projects_status ON harness_projects(status);
+  CREATE INDEX IF NOT EXISTS idx_harness_projects_pipeline_type ON harness_projects(pipeline_type);
+`;
+
+/**
+ * Le o SQL do CREATE TABLE atual de harness_projects via sqlite_master.
+ * Retorna null se a tabela nao existir (DB ainda nao migrou).
+ */
+export function getHarnessProjectsCreateSql(database: Database.Database): string | null {
+  const row = database
+    .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='harness_projects'")
+    .get() as { sql: string | null } | undefined;
+  return row?.sql ?? null;
+}
+
+/**
+ * Verifica se o CHECK constraint de harness_projects.status aceita
+ * 'aborted' E 'interrupted'. Retorna false se a tabela nao existir
+ * ou se o CHECK nao mencionar ambos.
+ */
+export function harnessProjectStatusCheckSupportsTerminalStates(database: Database.Database): boolean {
+  const sql = getHarnessProjectsCreateSql(database);
+  if (!sql) return false;
+  // Match dentro do CHECK do status. Procuramos por 'aborted' E 'interrupted'
+  // entre apostrofes (literais SQL) — evita falso positivo em comentarios.
+  return sql.includes("'aborted'") && sql.includes("'interrupted'");
+}
+
+/**
+ * Garante que o CHECK de harness_projects.status aceita 'aborted'/'interrupted'.
+ * Idempotente: se ja aceita, no-op. Senao aplica MIGRATION_V48_EXPAND_PROJECT_STATUS_CHECK
+ * (FK off/on, table-recreate preservando colunas e indices).
+ *
+ * NAO mexe em schema_version — quem chama decide se bumpa V48.
+ *
+ * Cobre o caso de drift onde schema_version >= 48 mas o CHECK real nao tem os
+ * estados (DB criado em outra branch onde V48 significava outra coisa).
+ */
+export function ensureHarnessProjectStatusCheckExpanded(database: Database.Database): void {
+  if (harnessProjectStatusCheckSupportsTerminalStates(database)) return;
+  // Se a tabela nao existir, MIGRATION_V21 ainda vai criar — nao tentar aqui.
+  if (getHarnessProjectsCreateSql(database) === null) return;
+  database.pragma('foreign_keys = OFF');
+  try {
+    database.exec(MIGRATION_V48_EXPAND_PROJECT_STATUS_CHECK);
+    logger.info(
+      'ensureHarnessProjectStatusCheckExpanded: applied schema-real migration (CHECK was missing aborted/interrupted)',
+    );
+  } finally {
+    database.pragma('foreign_keys = ON');
+  }
+}
+
+// V49: Reconciliacao insert-only de squads pra DBs antigas (fresh installs ja
+// nascem certo via S6.4a). Sem isso, instalacoes anteriores ao S6.4a continuam
+// com squad NULL ou 'workflow' nos agents seed.
+//
+// - tech-* foi seedado historicamente como 'workflow', deveria ser 'pipeline'
+// - harness/pipeline/security agents nunca tiveram squad declarado nos seeds
+//   antigos, entao nasceram NULL (reconcileSeedAgent so faz INSERT, nao UPDATE)
+const MIGRATION_V49_FIX_AGENT_SQUADS = `
+  UPDATE agents SET squad = 'pipeline'
+    WHERE id IN ('tech-database', 'tech-backend', 'tech-frontend', 'tech-security')
+      AND squad = 'workflow';
+
+  UPDATE agents SET squad = 'harness'
+    WHERE squad IS NULL AND id IN ('harness-coder', 'harness-planner', 'harness-evaluator');
+
+  UPDATE agents SET squad = 'pipeline'
+    WHERE squad IS NULL AND id IN ('repo-profiler', 'spec-builder', 'spec-validator');
+
+  UPDATE agents SET squad = 'security'
+    WHERE squad IS NULL AND id IN (
+      'security-secrets-scanner', 'security-auth-auditor', 'security-isolation-inspector',
+      'security-duplication-detector', 'security-logic-analyzer', 'security-standards-checker',
+      'security-owasp-scanner', 'security-deduplicator', 'security-skeptic-security',
+      'security-skeptic-quality', 'security-resolution-tracker'
+    );
+`;
+
+// V49 (TS prepared statement): allowed_tools pra security-secrets-scanner.
+// O seed atual exige Bash (pra rodar 'git log' e detectar .env commitados).
+// DBs antigos podem ter persistido sem Bash; condicional pra preservar
+// customizacoes do user.
+function applyMigrationV49Tools(database: Database.Database): void {
+  const OLD_TOOLS = '["Read","Grep","Glob"]';
+  const NEW_TOOLS = '["Read","Grep","Glob","Bash"]';
+  database
+    .prepare(`UPDATE agents SET allowed_tools = ? WHERE id = 'security-secrets-scanner' AND allowed_tools = ?`)
+    .run(NEW_TOOLS, OLD_TOOLS);
+}
+
+/**
+ * V52: Remove a tool 'Write' dos 8 agentes tech-* (feature pipeline + dev pipeline).
+ *
+ * Motivacao: esses agentes editam APENAS uma secao do PRD ja existente. 'Write' nao
+ * tem uso legitimo neles e e footgun pra modelos fracos (ex: GLM-4.7-flash sobrescreveu
+ * PRD inteira em vez de fazer Edit cirurgico). Edit sozinho cobre todos os casos
+ * (modificar secao existente E adicionar nova secao).
+ *
+ * Condicional: so atualiza se allowed_tools = OLD exato. Preserva customizacoes do user
+ * (mesmo padrao da V49).
+ *
+ * Agentes afetados:
+ * - Feature: feat-tech-database, feat-tech-backend, feat-tech-frontend, feat-tech-security
+ * - Dev:     tech-database, tech-backend, tech-frontend, tech-security
+ */
+function applyMigrationV52TechWriteRemoval(database: Database.Database): void {
+  const OLD_TOOLS = '["Read","Write","Edit","Glob","Grep"]';
+  const NEW_TOOLS = '["Read","Edit","Glob","Grep"]';
+  const AGENT_IDS = [
+    'feat-tech-database',
+    'feat-tech-backend',
+    'feat-tech-frontend',
+    'feat-tech-security',
+    'tech-database',
+    'tech-backend',
+    'tech-frontend',
+    'tech-security',
+  ];
+  const stmt = database.prepare(
+    `UPDATE agents SET allowed_tools = ? WHERE id = ? AND allowed_tools = ?`,
+  );
+  for (const id of AGENT_IDS) {
+    stmt.run(NEW_TOOLS, id, OLD_TOOLS);
+  }
+}
+
+// V51: Codex Windows fix infrastructure.
+// 1. codex_windows_prep_consent — opt-in versionado por repo Git para auto-prep
+//    (CRLF/.gitattributes). Ver SPEC-codex-windows-fix.md Camada 2.
+// 2. codex_patch_failures — telemetria de apply_patch verification failures por
+//    round (Camada 4). Default 0; runtimes nao-Codex sempre persistem 0.
+const MIGRATION_V51 = `
+  CREATE TABLE IF NOT EXISTS codex_windows_prep_consent (
+    repo_root TEXT PRIMARY KEY,
+    prep_version INTEGER NOT NULL,
+    action TEXT NOT NULL CHECK (action IN ('prepared', 'skip')),
+    consented_at INTEGER NOT NULL,
+    last_applied_at INTEGER
+  );
+
+  ALTER TABLE harness_rounds ADD COLUMN codex_patch_failures INTEGER DEFAULT 0;
+`;
+
 const MIGRATION_V20 = `
   CREATE TABLE IF NOT EXISTS task_executions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1563,6 +2041,7 @@ export function getAllSessions(): ChatSession[] {
     WHERE type IN ('chat', 'manual', 'telegram')
       AND status != 'trashed'
       AND task_id IS NULL
+      AND (title IS NULL OR title NOT LIKE '[Scheduler]%')
     ORDER BY updated_at DESC, created_at DESC
   `).all() as Record<string, unknown>[];
   return rows.map(mapSession);
@@ -1674,8 +2153,8 @@ export function getAgent(id: string): AgentConfig | undefined {
 export function insertAgent(agent: Omit<AgentConfig, 'sortOrder'> & { sortOrder?: number }): AgentConfig {
   const maxOrder = db.prepare('SELECT COALESCE(MAX(sort_order), 0) as m FROM agents').get() as { m: number };
   db.prepare(`
-    INSERT INTO agents (id, name, description, system_prompt, model, allowed_tools, mcp_servers, is_active, sort_order, effort, thinking, thinking_budget, max_turns, skills, runtime, local_config, local_mode, max_tool_rounds, squad)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO agents (id, name, description, system_prompt, model, allowed_tools, mcp_servers, is_active, sort_order, effort, thinking, thinking_budget, max_turns, skills, runtime, local_config, external_config, codex_config, local_mode, max_tool_rounds, squad)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     agent.id,
     agent.name,
@@ -1693,6 +2172,8 @@ export function insertAgent(agent: Omit<AgentConfig, 'sortOrder'> & { sortOrder?
     JSON.stringify(agent.skills || []),
     agent.runtime || 'cloud',
     agent.localConfig ? JSON.stringify(agent.localConfig) : null,
+    agent.externalConfig ? JSON.stringify(agent.externalConfig) : null,
+    agent.codexConfig ? JSON.stringify(agent.codexConfig) : null,
     agent.localMode || 'simple',
     agent.maxToolRounds ?? 5,
     agent.squad ?? null,
@@ -1719,6 +2200,8 @@ export function updateAgent(id: string, updates: Partial<AgentConfig>): AgentCon
   if (updates.skills !== undefined) { fields.push('skills = ?'); values.push(JSON.stringify(updates.skills)); }
   if (updates.runtime !== undefined) { fields.push('runtime = ?'); values.push(updates.runtime); }
   if (updates.localConfig !== undefined) { fields.push('local_config = ?'); values.push(JSON.stringify(updates.localConfig)); }
+  if (updates.externalConfig !== undefined) { fields.push('external_config = ?'); values.push(JSON.stringify(updates.externalConfig)); }
+  if (updates.codexConfig !== undefined) { fields.push('codex_config = ?'); values.push(updates.codexConfig ? JSON.stringify(updates.codexConfig) : null); }
   if (updates.localMode !== undefined) { fields.push('local_mode = ?'); values.push(updates.localMode); }
   if (updates.maxToolRounds !== undefined) { fields.push('max_tool_rounds = ?'); values.push(updates.maxToolRounds); }
   if (updates.squad !== undefined) { fields.push('squad = ?'); values.push(updates.squad); }
@@ -1753,6 +2236,8 @@ function mapAgent(row: Record<string, unknown>): AgentConfig {
     skills: JSON.parse((row['skills'] as string) || '[]'),
     runtime: (row['runtime'] as AgentConfig['runtime']) || 'cloud',
     localConfig: row['local_config'] ? JSON.parse(row['local_config'] as string) : undefined,
+    externalConfig: row['external_config'] ? (JSON.parse(row['external_config'] as string) as ExternalConfig) : undefined,
+    codexConfig: row['codex_config'] ? (JSON.parse(row['codex_config'] as string) as CodexConfig) : undefined,
     localMode: (row['local_mode'] as AgentConfig['localMode']) || 'simple',
     maxToolRounds: (row['max_tool_rounds'] as number) || 5,
     squad: (row['squad'] as string) || undefined,
@@ -1897,33 +2382,7 @@ export function getDailySummaries(from?: string, to?: string): DailySummary[] {
   }));
 }
 
-// ---- Token Usage ----
-
-export function insertTokenUsage(usage: {
-  sessionId: string;
-  model: string;
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens?: number;
-  cacheCreationTokens?: number;
-  costUsd: number;
-  subagent?: string;
-}): void {
-  const stmt = db.prepare(`
-    INSERT INTO token_usage (session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, subagent)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  stmt.run(
-    usage.sessionId,
-    usage.model,
-    usage.inputTokens,
-    usage.outputTokens,
-    usage.cacheReadTokens || 0,
-    usage.cacheCreationTokens || 0,
-    usage.costUsd,
-    usage.subagent || null,
-  );
-}
+// ---- Session Tokens (sessions table; CodeBurn embed handles dashboard) ----
 
 export function updateSessionTokens(sessionId: string, inputTokens: number, outputTokens: number, costUsd: number): void {
   const stmt = db.prepare(`
@@ -1937,15 +2396,6 @@ export function updateSessionTokens(sessionId: string, inputTokens: number, outp
   stmt.run(inputTokens, outputTokens, costUsd, sessionId);
 }
 
-export function getSessionTokens(sessionId: string): { inputTokens: number; outputTokens: number; costUsd: number } {
-  const row = db.prepare('SELECT input_tokens, output_tokens, cost_usd FROM sessions WHERE id = ?').get(sessionId) as Record<string, unknown> | undefined;
-  return {
-    inputTokens: (row?.['input_tokens'] as number) || 0,
-    outputTokens: (row?.['output_tokens'] as number) || 0,
-    costUsd: (row?.['cost_usd'] as number) || 0,
-  };
-}
-
 export function updateSessionStatus(sessionId: string, status: 'active' | 'archived' | 'compacted' | 'trashed'): void {
   db.prepare("UPDATE sessions SET status = ?, updated_at = datetime('now') WHERE id = ?").run(status, sessionId);
 }
@@ -1953,23 +2403,21 @@ export function updateSessionStatus(sessionId: string, status: 'active' | 'archi
 export function clearAllSessions(): void {
   const database = getDb();
   database.exec('DELETE FROM messages');
-  database.exec('DELETE FROM token_usage');
   database.exec('DELETE FROM audit_log');
   database.exec('DELETE FROM task_executions');
   database.exec('DELETE FROM sessions');
 }
 
-export function getActiveSession(): { id: string; title: string; type: string; createdAt: string; inputTokens: number; outputTokens: number } | null {
-  const row = db.prepare(`
-    SELECT id, title, type, created_at, input_tokens, output_tokens
-    FROM sessions
-    WHERE status = 'active'
-      AND type IN ('chat', 'manual', 'telegram')
-      AND task_id IS NULL
-    ORDER BY updated_at DESC
-    LIMIT 1
-  `).get() as Record<string, unknown> | undefined;
-  if (!row) return null;
+type ActiveSessionSummary = {
+  id: string;
+  title: string;
+  type: string;
+  createdAt: string;
+  inputTokens: number;
+  outputTokens: number;
+};
+
+function mapActiveSession(row: Record<string, unknown>): ActiveSessionSummary {
   return {
     id: row['id'] as string,
     title: (row['title'] as string) || '',
@@ -1980,102 +2428,33 @@ export function getActiveSession(): { id: string; title: string; type: string; c
   };
 }
 
-// ---- Usage Stats ----
-
-export interface UsageStats {
-  totalInputTokens: number;
-  totalOutputTokens: number;
-  totalCostUsd: number;
-  totalRequests: number;
-  byModel: Array<{ model: string; inputTokens: number; outputTokens: number; costUsd: number; requests: number }>;
-  byDay: Array<{ date: string; inputTokens: number; outputTokens: number; costUsd: number; requests: number }>;
+export function getActiveSession(): ActiveSessionSummary | null {
+  const row = db.prepare(`
+    SELECT id, title, type, created_at, input_tokens, output_tokens
+    FROM sessions
+    WHERE status = 'active'
+      AND type IN ('chat', 'manual', 'telegram')
+      AND task_id IS NULL
+    ORDER BY updated_at DESC, created_at DESC
+    LIMIT 1
+  `).get() as Record<string, unknown> | undefined;
+  if (!row) return null;
+  return mapActiveSession(row);
 }
 
-export function getUsageStats(filter: {
-  from?: string;
-  to?: string;
-  model?: string;
-  sessionId?: string;
-}): UsageStats {
-  const conditions: string[] = ['1=1'];
-  const params: unknown[] = [];
-
-  if (filter.from) {
-    conditions.push('created_at >= ?');
-    params.push(filter.from);
-  }
-  if (filter.to) {
-    conditions.push('created_at <= ?');
-    params.push(filter.to);
-  }
-  if (filter.model) {
-    conditions.push('model = ?');
-    params.push(filter.model);
-  }
-  if (filter.sessionId) {
-    conditions.push('session_id = ?');
-    params.push(filter.sessionId);
-  }
-
-  const whereClause = conditions.join(' AND ');
-
-  const totals = db.prepare(`
-    SELECT
-      COALESCE(SUM(input_tokens), 0) as total_input,
-      COALESCE(SUM(output_tokens), 0) as total_output,
-      COALESCE(SUM(cost_usd), 0) as total_cost,
-      COUNT(*) as total_requests
-    FROM token_usage
-    WHERE ${whereClause}
-  `).get(...params) as Record<string, number>;
-
-  const byModel = db.prepare(`
-    SELECT
-      model,
-      SUM(input_tokens) as input_tokens,
-      SUM(output_tokens) as output_tokens,
-      SUM(cost_usd) as cost_usd,
-      COUNT(*) as requests
-    FROM token_usage
-    WHERE ${whereClause}
-    GROUP BY model
-    ORDER BY cost_usd DESC
-  `).all(...params) as Array<Record<string, unknown>>;
-
-  const byDay = db.prepare(`
-    SELECT
-      DATE(created_at) as date,
-      SUM(input_tokens) as input_tokens,
-      SUM(output_tokens) as output_tokens,
-      SUM(cost_usd) as cost_usd,
-      COUNT(*) as requests
-    FROM token_usage
-    WHERE ${whereClause}
-    GROUP BY DATE(created_at)
-    ORDER BY date DESC
-    LIMIT 90
-  `).all(...params) as Array<Record<string, unknown>>;
-
-  return {
-    totalInputTokens: totals['total_input'] || 0,
-    totalOutputTokens: totals['total_output'] || 0,
-    totalCostUsd: totals['total_cost'] || 0,
-    totalRequests: totals['total_requests'] || 0,
-    byModel: byModel.map((r) => ({
-      model: r['model'] as string,
-      inputTokens: (r['input_tokens'] as number) || 0,
-      outputTokens: (r['output_tokens'] as number) || 0,
-      costUsd: (r['cost_usd'] as number) || 0,
-      requests: (r['requests'] as number) || 0,
-    })),
-    byDay: byDay.map((r) => ({
-      date: r['date'] as string,
-      inputTokens: (r['input_tokens'] as number) || 0,
-      outputTokens: (r['output_tokens'] as number) || 0,
-      costUsd: (r['cost_usd'] as number) || 0,
-      requests: (r['requests'] as number) || 0,
-    })),
-  };
+export function getActiveChatSession(): ActiveSessionSummary | null {
+  const row = db.prepare(`
+    SELECT id, title, type, created_at, input_tokens, output_tokens
+    FROM sessions
+    WHERE status = 'active'
+      AND type IN ('chat', 'manual')
+      AND task_id IS NULL
+      AND (title IS NULL OR title NOT LIKE '[Scheduler]%')
+    ORDER BY updated_at DESC, created_at DESC
+    LIMIT 1
+  `).get() as Record<string, unknown> | undefined;
+  if (!row) return null;
+  return mapActiveSession(row);
 }
 
 // ---- Tool Settings ----
@@ -2301,65 +2680,25 @@ export function searchVector(queryEmbedding: Buffer, limit: number = 20): Array<
   return rows;
 }
 
-export function ensureSkillCreatorAgent(): void {
-  const exists = db.prepare('SELECT id FROM agents WHERE id = ?').get(SKILL_CREATOR_ID);
-  if (exists) return;
-
-  insertAgent(skillCreator);
-  logger.info('Ensured skill-creator agent exists');
-}
-
 /**
- * Ensure all Harness seed agents exist in the database.
- * Called on app startup. Only inserts agents that don't already exist.
- * If the user deleted a harness agent, this re-creates it.
+ * Reconcile a single seed agent with the database.
+ *
+ * Behaviour:
+ *  - If the agent does not exist, INSERT it (full record from the seed).
+ *  - If it exists, do nothing — user edits via the UI are authoritative and
+ *    must survive every app boot.
  */
-export function ensureHarnessAgents(): void {
-  const upsert = db.transaction(() => {
-    for (const agent of HARNESS_SEED_AGENTS) {
-      const existing = db
-        .prepare('SELECT id, system_prompt FROM agents WHERE id = ?')
-        .get(agent.id) as { id: string; system_prompt: string } | undefined;
-      if (!existing) {
-        insertAgent(agent);
-        logger.info({ agentId: agent.id }, 'Created harness seed agent');
-      } else if (existing.system_prompt !== agent.systemPrompt) {
-        db.prepare('UPDATE agents SET system_prompt = ? WHERE id = ?').run(
-          agent.systemPrompt,
-          agent.id,
-        );
-        logger.info({ agentId: agent.id }, 'Reconciled harness seed agent system_prompt with source');
-      }
-    }
-  });
-  upsert();
+export function reconcileSeedAgent(agent: Omit<AgentConfig, 'sortOrder'>, category: string): void {
+  const existing = db.prepare('SELECT id FROM agents WHERE id = ?').get(agent.id);
+  if (existing) return;
+  insertAgent(agent);
+  logger.info({ agentId: agent.id, category }, 'Created seed agent');
 }
 
-/**
- * Ensure all Workflow (BuildPlan) seed agents exist in the database.
- * Called on app startup. Only inserts agents that don't already exist.
- * If the user deleted a workflow agent, this re-creates it.
- */
-export function ensureWorkflowAgents(): void {
-  const upsert = db.transaction(() => {
-    for (const agent of WORKFLOW_SEED_AGENTS) {
-      const existing = db
-        .prepare('SELECT id, system_prompt FROM agents WHERE id = ?')
-        .get(agent.id) as { id: string; system_prompt: string } | undefined;
-      if (!existing) {
-        insertAgent(agent);
-        logger.info({ agentId: agent.id }, 'Created workflow seed agent');
-      } else if (existing.system_prompt !== agent.systemPrompt) {
-        db.prepare('UPDATE agents SET system_prompt = ? WHERE id = ?').run(
-          agent.systemPrompt,
-          agent.id,
-        );
-        logger.info({ agentId: agent.id }, 'Reconciled workflow seed agent system_prompt with source');
-      }
-    }
-  });
-  upsert();
-}
+// NOTE: as funcoes ensure*Agents() historicas foram removidas. O boot agora
+// usa `ensureAllSeedAgents()` de `seed-agents/ensure.ts`, que reconcilia todos
+// os seeds (insert-only) e materializa snapshots em .lionclaw/agents/.
+// reconcileSeedAgent permanece exportado pra ser usado por aquele modulo.
 
 // ---- Knowledge Base CRUD ----
 
@@ -2981,159 +3320,6 @@ export function insertTaskExecution(data: {
   );
 }
 
-export interface AgentUsageStats {
-  totalCostUsd: number;
-  totalInputTokens: number;
-  totalOutputTokens: number;
-  totalRequests: number;
-  byAgent: Array<{
-    agentId: string | null;
-    agentName: string;
-    model: string;
-    executions: number;
-    totalRequests: number;
-    inputTokens: number;
-    outputTokens: number;
-    cacheReadTokens: number;
-    cacheCreationTokens: number;
-    costUsd: number;
-    toolUses: number;
-    totalDurationMs: number;
-  }>;
-  byDay: Array<{
-    date: string;
-    inputTokens: number;
-    outputTokens: number;
-    costUsd: number;
-    requests: number;
-  }>;
-}
-
-export function getUsageByAgent(filter: { from?: string; to?: string }): AgentUsageStats {
-  const conditions: string[] = ['1=1'];
-  const params: unknown[] = [];
-
-  if (filter.from) {
-    conditions.push('created_at >= ?');
-    params.push(filter.from);
-  }
-  if (filter.to) {
-    conditions.push('created_at <= ?');
-    params.push(filter.to);
-  }
-
-  const whereClause = conditions.join(' AND ');
-
-  const byAgent = db.prepare(`
-    SELECT
-      agent_id,
-      agent_name,
-      model,
-      COUNT(*) as executions,
-      COALESCE(SUM(api_requests), 0) as total_requests,
-      COALESCE(SUM(input_tokens), 0) as input_tokens,
-      COALESCE(SUM(output_tokens), 0) as output_tokens,
-      COALESCE(SUM(cache_read_tokens), 0) as cache_read_tokens,
-      COALESCE(SUM(cache_creation_tokens), 0) as cache_creation_tokens,
-      COALESCE(SUM(cost_usd), 0) as cost_usd,
-      COALESCE(SUM(tool_uses), 0) as tool_uses,
-      COALESCE(SUM(duration_ms), 0) as total_duration_ms
-    FROM task_executions
-    WHERE ${whereClause}
-    GROUP BY agent_id, agent_name, model
-    HAVING COALESCE(SUM(input_tokens), 0) > 0 OR COALESCE(SUM(output_tokens), 0) > 0
-    ORDER BY cost_usd DESC
-  `).all(...params) as Array<Record<string, unknown>>;
-
-  const byDay = db.prepare(`
-    SELECT
-      DATE(created_at) as date,
-      COALESCE(SUM(input_tokens), 0) as input_tokens,
-      COALESCE(SUM(output_tokens), 0) as output_tokens,
-      COALESCE(SUM(cost_usd), 0) as cost_usd,
-      COUNT(*) as requests
-    FROM task_executions
-    WHERE ${whereClause}
-    GROUP BY DATE(created_at)
-    ORDER BY date DESC
-    LIMIT 90
-  `).all(...params) as Array<Record<string, unknown>>;
-
-  const totalsRow = db.prepare(`
-    SELECT
-      COALESCE(SUM(cost_usd), 0) as total_cost,
-      COALESCE(SUM(input_tokens), 0) as total_input,
-      COALESCE(SUM(output_tokens), 0) as total_output,
-      COUNT(*) as total_requests
-    FROM task_executions
-    WHERE ${whereClause}
-  `).get(...params) as Record<string, number>;
-
-  return {
-    totalCostUsd: totalsRow['total_cost'] || 0,
-    totalInputTokens: totalsRow['total_input'] || 0,
-    totalOutputTokens: totalsRow['total_output'] || 0,
-    totalRequests: totalsRow['total_requests'] || 0,
-    byAgent: byAgent.map((r) => ({
-      agentId: (r['agent_id'] as string) || null,
-      agentName: (r['agent_name'] as string) || '',
-      model: (r['model'] as string) || '',
-      executions: (r['executions'] as number) || 0,
-      totalRequests: (r['total_requests'] as number) || 0,
-      inputTokens: (r['input_tokens'] as number) || 0,
-      outputTokens: (r['output_tokens'] as number) || 0,
-      cacheReadTokens: (r['cache_read_tokens'] as number) || 0,
-      cacheCreationTokens: (r['cache_creation_tokens'] as number) || 0,
-      costUsd: (r['cost_usd'] as number) || 0,
-      toolUses: (r['tool_uses'] as number) || 0,
-      totalDurationMs: (r['total_duration_ms'] as number) || 0,
-    })),
-    byDay: byDay.map((r) => ({
-      date: r['date'] as string,
-      inputTokens: (r['input_tokens'] as number) || 0,
-      outputTokens: (r['output_tokens'] as number) || 0,
-      costUsd: (r['cost_usd'] as number) || 0,
-      requests: (r['requests'] as number) || 0,
-    })),
-  };
-}
-
-export function getTaskExecutions(filter: {
-  sessionId?: string;
-  agentId?: string;
-  from?: string;
-  to?: string;
-}): Array<Record<string, unknown>> {
-  const conditions: string[] = ['1=1'];
-  const params: unknown[] = [];
-
-  if (filter.sessionId) {
-    conditions.push('session_id = ?');
-    params.push(filter.sessionId);
-  }
-  if (filter.agentId) {
-    conditions.push('agent_id = ?');
-    params.push(filter.agentId);
-  }
-  if (filter.from) {
-    conditions.push('created_at >= ?');
-    params.push(filter.from);
-  }
-  if (filter.to) {
-    conditions.push('created_at <= ?');
-    params.push(filter.to);
-  }
-
-  const whereClause = conditions.join(' AND ');
-
-  return db.prepare(`
-    SELECT * FROM task_executions
-    WHERE ${whereClause}
-    ORDER BY created_at DESC
-    LIMIT 500
-  `).all(...params) as Array<Record<string, unknown>>;
-}
-
 // ---- Harness Projects ----
 
 function mapHarnessProject(row: Record<string, unknown>): HarnessProject {
@@ -3162,7 +3348,44 @@ function mapHarnessProject(row: Record<string, unknown>): HarnessProject {
     pipelineStartPhase: row['pipeline_start_phase'] as number | null | undefined,
     pipelineSprintIndex: (row['pipeline_sprint_index'] as number | null | undefined) ?? 0,
     pipelineDiscoveryBlock: (row['pipeline_discovery_block'] as number | null | undefined) ?? 1,
+    pipelineType: ((row['pipeline_type'] as string | undefined) ?? 'development') as PipelineType,
+    pipelineDocsId: (row['pipeline_docs_id'] as string | null) ?? null,
   };
+}
+
+function applyLegacyHarnessSprintsJsonMigration(project: HarnessProject): HarnessProject {
+  try {
+    const result = migrateLegacyHarnessSprintsJsonFile(project);
+    if (result.shouldUpdateDb) {
+      db.prepare(`
+        UPDATE harness_projects
+        SET sprints_json_path = ?, updated_at = datetime('now')
+        WHERE id = ?
+      `).run(result.canonicalPath, project.id);
+      return { ...project, sprintsJsonPath: result.canonicalPath };
+    }
+  } catch (err) {
+    logger.warn({ err, projectId: project.id }, 'Failed to migrate legacy harness sprints JSON');
+  }
+  return project;
+}
+
+export function migrateLegacyHarnessSprintsJsonPaths(): void {
+  let rows: Record<string, unknown>[];
+  try {
+    rows = db.prepare(`
+      SELECT * FROM harness_projects
+      WHERE sprints_json_path IS NOT NULL
+        AND sprints_json_path != ''
+    `).all() as Record<string, unknown>[];
+  } catch (err) {
+    logger.warn({ err }, 'Failed to query harness projects for legacy sprints migration');
+    return;
+  }
+
+  for (const row of rows) {
+    applyLegacyHarnessSprintsJsonMigration(mapHarnessProject(row));
+  }
 }
 
 export function insertHarnessProject(data: {
@@ -3172,10 +3395,12 @@ export function insertHarnessProject(data: {
   specPath: string;
   sprintsJsonPath?: string;
   config: HarnessProject['config'];
+  pipelineType?: PipelineType;
+  pipelineDocsId?: string | null;
 }): HarnessProject {
   const result = db.prepare(`
-    INSERT INTO harness_projects (name, description, project_path, spec_path, sprints_json_path, config)
-    VALUES (?, ?, ?, ?, ?, ?)
+    INSERT INTO harness_projects (name, description, project_path, spec_path, sprints_json_path, config, pipeline_type, pipeline_docs_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     data.name,
     data.description ?? null,
@@ -3183,6 +3408,8 @@ export function insertHarnessProject(data: {
     data.specPath,
     data.sprintsJsonPath ?? null,
     JSON.stringify(data.config),
+    data.pipelineType ?? 'development',
+    data.pipelineDocsId ?? null,
   );
   const id = db.prepare('SELECT id FROM harness_projects WHERE rowid = ?').get(result.lastInsertRowid) as { id: string };
   return getHarnessProject(id.id)!;
@@ -3204,6 +3431,7 @@ export function updateHarnessProject(id: string, updates: Partial<{
   plannerCacheTokens: number;
   plannerCostUsd: number;
   plannerDurationMs: number;
+  pipelineDocsId: string | null;
 }>): HarnessProject {
   const fields: string[] = [];
   const values: unknown[] = [];
@@ -3223,6 +3451,7 @@ export function updateHarnessProject(id: string, updates: Partial<{
   if (updates.plannerCacheTokens !== undefined)  { fields.push('planner_cache_tokens = ?');  values.push(updates.plannerCacheTokens); }
   if (updates.plannerCostUsd !== undefined)      { fields.push('planner_cost_usd = ?');      values.push(updates.plannerCostUsd); }
   if (updates.plannerDurationMs !== undefined)   { fields.push('planner_duration_ms = ?');   values.push(updates.plannerDurationMs); }
+  if (updates.pipelineDocsId !== undefined)      { fields.push('pipeline_docs_id = ?');      values.push(updates.pipelineDocsId); }
 
   if (fields.length > 0) {
     fields.push(`updated_at = datetime('now')`);
@@ -3235,12 +3464,12 @@ export function updateHarnessProject(id: string, updates: Partial<{
 export function getHarnessProject(id: string): HarnessProject | undefined {
   const row = db.prepare('SELECT * FROM harness_projects WHERE id = ?').get(id) as Record<string, unknown> | undefined;
   if (!row) return undefined;
-  return mapHarnessProject(row);
+  return applyLegacyHarnessSprintsJsonMigration(mapHarnessProject(row));
 }
 
 export function listHarnessProjects(): HarnessProject[] {
   const rows = db.prepare('SELECT * FROM harness_projects ORDER BY created_at DESC').all() as Record<string, unknown>[];
-  return rows.map(mapHarnessProject);
+  return rows.map((row) => applyLegacyHarnessSprintsJsonMigration(mapHarnessProject(row)));
 }
 
 /**
@@ -3248,6 +3477,19 @@ export function listHarnessProjects(): HarnessProject[] {
  * Also removes the project directory from filesystem.
  */
 export function deleteHarnessProject(id: string): void {
+  // Database-only cleanup: deletes rounds → sprints → project rows.
+  //
+  // FILES ON DISK ARE NOT TOUCHED. This is intentional and matches the
+  // security pipeline pattern (`.lionclaw/Security/Security-*.md` files
+  // also persist after delete). For architecture-review,
+  // `<projectPath>/.lionclaw/pipelines/architecture-review/<runId>/`
+  // remains on disk so the user retains the human-readable artefacts
+  // (Map / Candidates / Diagnosis / Decisions / SPEC) for review.
+  //
+  // If the user wants to also delete files, they remove the dir manually.
+  // A future `pipeline:delete-artifacts(projectId)` IPC could automate this
+  // with destructive confirmation — explicitly out of scope for the MVP
+  // (per ARCHITECTURE-REVIEW-PIPELINE-SPEC.md §9.3).
   const deleteAll = db.transaction(() => {
     // 1. Delete rounds (child of sprints)
     db.prepare(`
@@ -3260,7 +3502,7 @@ export function deleteHarnessProject(id: string): void {
     db.prepare('DELETE FROM harness_projects WHERE id = ?').run(id);
   });
   deleteAll();
-  logger.info({ projectId: id }, 'Deleted harness project and related data');
+  logger.info({ projectId: id }, 'Deleted harness project and related data (files on disk preserved)');
 }
 
 // ---- Harness Sprints ----
@@ -3372,6 +3614,12 @@ function mapHarnessRound(row: Record<string, unknown>): HarnessRound {
     feedbackSummary: row['feedback_summary'] as string | undefined,
     startedAt: row['started_at'] as string,
     completedAt: row['completed_at'] as string | undefined,
+    costSource: (row['cost_source'] as CostSource | null) ?? null,
+    runtimeUsed: (row['runtime_used'] as HarnessRound['runtimeUsed']) ?? null,
+    providerUsed: (row['provider_used'] as string | null) ?? null,
+    modelUsed: (row['model_used'] as string | null) ?? null,
+    metadata: row['metadata'] ? (JSON.parse(row['metadata'] as string) as Record<string, unknown>) : {},
+    codexPatchFailures: (row['codex_patch_failures'] as number) ?? 0,
   };
 }
 
@@ -3379,14 +3627,22 @@ export function insertHarnessRound(data: {
   sprintId: string;
   roundNumber: number;
   coderSessionId?: string;
+  costSource?: CostSource | null;
+  runtimeUsed?: 'cloud' | 'local' | 'external' | null;
+  providerUsed?: string | null;
+  modelUsed?: string | null;
 }): HarnessRound {
   const result = db.prepare(`
-    INSERT INTO harness_rounds (sprint_id, round_number, coder_session_id)
-    VALUES (?, ?, ?)
+    INSERT INTO harness_rounds (sprint_id, round_number, coder_session_id, cost_source, runtime_used, provider_used, model_used)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
   `).run(
     data.sprintId,
     data.roundNumber,
     data.coderSessionId ?? null,
+    data.costSource ?? null,
+    data.runtimeUsed ?? null,
+    data.providerUsed ?? null,
+    data.modelUsed ?? null,
   );
   const row = db.prepare('SELECT * FROM harness_rounds WHERE rowid = ?').get(result.lastInsertRowid) as Record<string, unknown>;
   return mapHarnessRound(row);
@@ -3412,6 +3668,12 @@ export function updateHarnessRound(id: string, updates: Partial<{
   verdict: HarnessRound['verdict'];
   feedbackSummary: string | null;
   completedAt: string | null;
+  costSource: CostSource | null;
+  runtimeUsed: 'cloud' | 'local' | 'external' | null;
+  providerUsed: string | null;
+  modelUsed: string | null;
+  metadata: Record<string, unknown>;
+  codexPatchFailures: number;
 }>): HarnessRound {
   const fields: string[] = [];
   const values: unknown[] = [];
@@ -3435,6 +3697,12 @@ export function updateHarnessRound(id: string, updates: Partial<{
   if (updates.verdict !== undefined)             { fields.push('verdict = ?');               values.push(updates.verdict); }
   if (updates.feedbackSummary !== undefined)     { fields.push('feedback_summary = ?');      values.push(updates.feedbackSummary); }
   if (updates.completedAt !== undefined)         { fields.push('completed_at = ?');          values.push(updates.completedAt); }
+  if (updates.costSource !== undefined)          { fields.push('cost_source = ?');           values.push(updates.costSource); }
+  if (updates.runtimeUsed !== undefined)         { fields.push('runtime_used = ?');          values.push(updates.runtimeUsed); }
+  if (updates.providerUsed !== undefined)        { fields.push('provider_used = ?');         values.push(updates.providerUsed); }
+  if (updates.modelUsed !== undefined)           { fields.push('model_used = ?');            values.push(updates.modelUsed); }
+  if (updates.metadata !== undefined)            { fields.push('metadata = ?');              values.push(JSON.stringify(updates.metadata)); }
+  if (updates.codexPatchFailures !== undefined)  { fields.push('codex_patch_failures = ?');  values.push(updates.codexPatchFailures); }
 
   if (fields.length > 0) {
     values.push(id);
@@ -3450,6 +3718,65 @@ export function getHarnessRounds(sprintId: string): HarnessRound[] {
     'SELECT * FROM harness_rounds WHERE sprint_id = ? ORDER BY round_number ASC',
   ).all(sprintId) as Record<string, unknown>[];
   return rows.map(mapHarnessRound);
+}
+
+/**
+ * Returns per-round details for a sprint, enriched with the model used by
+ * Coder and Evaluator. coderModel/evaluatorModel come from harness_rounds.model_used
+ * which is populated by spawnCoder/spawnEvaluator via updateHarnessRound.
+ * Falls back to pipeline_phase_metrics.model when rounds have no model_used recorded.
+ */
+export function getRoundDetailsForSprint(projectId: string, sprintIndex: number): RoundDetail[] {
+  const sprintRow = db.prepare(
+    `SELECT id FROM harness_sprints WHERE project_id = ? AND sprint_index = ? LIMIT 1`,
+  ).get(projectId, sprintIndex) as { id: string } | undefined;
+  if (!sprintRow) return [];
+
+  const rounds = db.prepare(
+    `SELECT round_number, verdict, feedback_summary,
+            model_used,
+            coder_input_tokens, coder_output_tokens, coder_cost_usd, coder_duration_ms,
+            evaluator_input_tokens, evaluator_output_tokens, evaluator_cost_usd, evaluator_duration_ms,
+            started_at, completed_at
+     FROM harness_rounds
+     WHERE sprint_id = ?
+     ORDER BY round_number ASC`,
+  ).all(sprintRow.id) as Record<string, unknown>[];
+
+  // Fallback: read coder/evaluator model from pipeline_phase_metrics if rounds don't have it.
+  // Phases 10 or 13 = Coder; 11 or 14 = Evaluator.
+  const coderPhaseRow = db.prepare(
+    `SELECT model FROM pipeline_phase_metrics
+     WHERE project_id = ? AND sprint_index = ? AND phase_number IN (10, 13)
+     LIMIT 1`,
+  ).get(projectId, sprintIndex) as { model: string | null } | undefined;
+
+  const evalPhaseRow = db.prepare(
+    `SELECT model FROM pipeline_phase_metrics
+     WHERE project_id = ? AND sprint_index = ? AND phase_number IN (11, 14)
+     LIMIT 1`,
+  ).get(projectId, sprintIndex) as { model: string | null } | undefined;
+
+  const fallbackCoderModel = coderPhaseRow?.model ?? null;
+  const fallbackEvalModel = evalPhaseRow?.model ?? null;
+
+  return rounds.map(r => ({
+    roundNumber: (r['round_number'] as number),
+    verdict: (r['verdict'] as string | null) ?? null,
+    feedbackSummary: (r['feedback_summary'] as string | null) ?? null,
+    coderModel: (r['model_used'] as string | null) ?? fallbackCoderModel,
+    evaluatorModel: (r['model_used'] as string | null) ?? fallbackEvalModel,
+    coderInputTokens: (r['coder_input_tokens'] as number) ?? 0,
+    coderOutputTokens: (r['coder_output_tokens'] as number) ?? 0,
+    coderCostUsd: (r['coder_cost_usd'] as number) ?? 0,
+    coderDurationMs: (r['coder_duration_ms'] as number) ?? 0,
+    evaluatorInputTokens: (r['evaluator_input_tokens'] as number) ?? 0,
+    evaluatorOutputTokens: (r['evaluator_output_tokens'] as number) ?? 0,
+    evaluatorCostUsd: (r['evaluator_cost_usd'] as number) ?? 0,
+    evaluatorDurationMs: (r['evaluator_duration_ms'] as number) ?? 0,
+    startedAt: (r['started_at'] as string | null) ?? null,
+    completedAt: (r['completed_at'] as string | null) ?? null,
+  }));
 }
 
 export interface HarnessSprintAggregateMetrics {
@@ -3585,74 +3912,6 @@ export function getHarnessProjectMetrics(projectId: string): HarnessProjectMetri
     plannerCost,
     sprintMetrics,
   };
-}
-
-// ---- Workflow Runs CRUD ----
-
-function mapWorkflowRun(row: Record<string, unknown>): WorkflowRun {
-  return {
-    id: row['id'] as string,
-    workflowId: row['workflow_id'] as string,
-    sessionId: row['session_id'] as string,
-    currentStage: (row['current_stage'] as number) ?? 1,
-    currentQuestion: (row['current_question'] as string) ?? 'Q1',
-    notesPath: (row['notes_path'] as string) ?? null,
-    status: (row['status'] as WorkflowRun['status']) ?? 'active',
-    startedAt: row['started_at'] as string,
-    updatedAt: row['updated_at'] as string,
-    completedAt: (row['completed_at'] as string) ?? null,
-  };
-}
-
-export function insertWorkflowRun(run: Omit<WorkflowRun, 'startedAt' | 'updatedAt' | 'completedAt'>): WorkflowRun {
-  db.prepare(`
-    INSERT INTO workflow_runs (id, workflow_id, session_id, current_stage, notes_path, status)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).run(
-    run.id,
-    run.workflowId,
-    run.sessionId,
-    run.currentStage ?? 1,
-    run.notesPath ?? null,
-    run.status ?? 'active',
-  );
-  return getWorkflowRun(run.id)!;
-}
-
-export function getWorkflowRun(id: string): WorkflowRun | undefined {
-  const row = db.prepare('SELECT * FROM workflow_runs WHERE id = ?').get(id) as Record<string, unknown> | undefined;
-  if (!row) return undefined;
-  return mapWorkflowRun(row);
-}
-
-export function getActiveWorkflowRun(): WorkflowRun | null {
-  const row = db.prepare("SELECT * FROM workflow_runs WHERE status IN ('active', 'generating') ORDER BY started_at DESC LIMIT 1").get() as Record<string, unknown> | undefined;
-  if (!row) return null;
-  return mapWorkflowRun(row);
-}
-
-export function updateWorkflowStage(id: string, stage: number): void {
-  db.prepare(`UPDATE workflow_runs SET current_stage = ?, updated_at = datetime('now') WHERE id = ?`).run(stage, id);
-}
-
-export function updateWorkflowQuestion(id: string, question: string): void {
-  db.prepare(`UPDATE workflow_runs SET current_question = ?, updated_at = datetime('now') WHERE id = ?`).run(question, id);
-}
-
-export function setWorkflowRunGenerating(id: string): void {
-  db.prepare(`UPDATE workflow_runs SET status = 'generating', updated_at = datetime('now') WHERE id = ?`).run(id);
-}
-
-export function setWorkflowRunActive(id: string): void {
-  db.prepare(`UPDATE workflow_runs SET status = 'active', updated_at = datetime('now') WHERE id = ?`).run(id);
-}
-
-export function completeWorkflowRun(id: string): void {
-  db.prepare(`UPDATE workflow_runs SET status = 'completed', completed_at = datetime('now'), updated_at = datetime('now') WHERE id = ?`).run(id);
-}
-
-export function cancelWorkflowRun(id: string): void {
-  db.prepare(`UPDATE workflow_runs SET status = 'cancelled', updated_at = datetime('now') WHERE id = ?`).run(id);
 }
 
 // ---- Enrich Sessions CRUD ----
@@ -3841,125 +4100,146 @@ export function accumulateEnrichMetrics(
   db.prepare(`UPDATE enrich_sessions SET ${cols.join(', ')} WHERE id = ?`).run(...values);
 }
 
-/**
- * Ensure all Enrich seed agents exist in the database.
- * Called on app startup. Only inserts agents that do not already exist.
- * If the user deleted an enrich agent, this re-creates it.
- */
-export function ensureEnrichAgents(): void {
-  const upsert = db.transaction(() => {
-    for (const agent of ENRICH_SEED_AGENTS) {
-      const existing = db
-        .prepare('SELECT id, system_prompt FROM agents WHERE id = ?')
-        .get(agent.id) as { id: string; system_prompt: string } | undefined;
-      if (!existing) {
-        insertAgent(agent);
-        logger.info({ agentId: agent.id }, 'Created enrich seed agent');
-      } else if (existing.system_prompt !== agent.systemPrompt) {
-        db.prepare('UPDATE agents SET system_prompt = ? WHERE id = ?').run(
-          agent.systemPrompt,
-          agent.id,
-        );
-        logger.info({ agentId: agent.id }, 'Reconciled enrich seed agent system_prompt with source');
-      }
-    }
-  });
-  upsert();
+// NOTE: ensureEnrichAgents/ensureDevAgents/ensurePipelineAgents/ensureTechAgents/
+// ensureSecurityAgents/ensureFeatureAgents foram removidas — substituidas pela
+// `ensureAllSeedAgents()` em `seed-agents/ensure.ts`.
+
+// ---- Security Agent Status CRUD ----
+
+export interface SecurityAgentStatusRow {
+  id: number;
+  projectId: string;
+  agentId: string;
+  agentName: string;
+  status: 'pending' | 'running' | 'completed' | 'failed';
+  findingsCount: number;
+  outputFile?: string;
+  startedAt?: string;
+  completedAt?: string;
+  errorMessage?: string;
+  createdAt: string;
 }
 
-/**
- * Ensure all Dev seed agents exist in the database.
- * Called on app startup. Only inserts agents that don't already exist.
- * If the user deleted a dev agent, this re-creates it.
- */
-export function ensureDevAgents(): void {
-  const upsert = db.transaction(() => {
-    for (const agent of DEV_SEED_AGENTS) {
-      const existing = db
-        .prepare('SELECT id, system_prompt FROM agents WHERE id = ?')
-        .get(agent.id) as { id: string; system_prompt: string } | undefined;
-      if (!existing) {
-        insertAgent(agent);
-        logger.info({ agentId: agent.id }, 'Created dev seed agent');
-      } else if (existing.system_prompt !== agent.systemPrompt) {
-        db.prepare('UPDATE agents SET system_prompt = ? WHERE id = ?').run(
-          agent.systemPrompt,
-          agent.id,
-        );
-        logger.info({ agentId: agent.id }, 'Reconciled dev seed agent system_prompt with source');
-      }
-    }
-  });
-  upsert();
+function mapSecurityAgentStatus(row: Record<string, unknown>): SecurityAgentStatusRow {
+  return {
+    id: row['id'] as number,
+    projectId: row['project_id'] as string,
+    agentId: row['agent_id'] as string,
+    agentName: row['agent_name'] as string,
+    status: row['status'] as SecurityAgentStatusRow['status'],
+    findingsCount: (row['findings_count'] as number) ?? 0,
+    outputFile: row['output_file'] as string | undefined,
+    startedAt: row['started_at'] as string | undefined,
+    completedAt: row['completed_at'] as string | undefined,
+    errorMessage: row['error_message'] as string | undefined,
+    createdAt: row['created_at'] as string,
+  };
 }
 
-/**
- * Ensure all Pipeline seed agents exist in the database.
- * Called on app startup. Inserts agents that do not already exist.
- * For existing agents, reconciles the `system_prompt` field with the source
- * seed so that prompt updates shipped in new versions take effect on boot
- * (fix for BUG-22: the spec-builder seed referenced discovery-notes.md but
- * runtime feeds it PRD.md + stories-requisitos.md; without reconciliation,
- * the DB copy drifts from source). Other fields (model, effort, tools, etc.)
- * are preserved so user customizations are not overwritten.
- * If the user deleted a pipeline agent, this re-creates it.
- */
-export function ensurePipelineAgents(): void {
-  const upsert = db.transaction(() => {
-    for (const agent of PIPELINE_SEED_AGENTS) {
-      const existing = db
-        .prepare('SELECT id, system_prompt FROM agents WHERE id = ?')
-        .get(agent.id) as { id: string; system_prompt: string } | undefined;
-      if (!existing) {
-        insertAgent(agent);
-        logger.info({ agentId: agent.id }, 'Created pipeline seed agent');
-      } else if (existing.system_prompt !== agent.systemPrompt) {
-        db.prepare('UPDATE agents SET system_prompt = ? WHERE id = ?').run(
-          agent.systemPrompt,
-          agent.id,
-        );
-        logger.info(
-          { agentId: agent.id },
-          'Reconciled pipeline seed agent system_prompt with source (BUG-22)',
-        );
-      }
+export function insertSecurityAgentStatus(
+  projectId: string,
+  agents: Array<{ agentId: string; agentName: string }>,
+): void {
+  const insert = db.transaction(() => {
+    const stmt = db.prepare(`
+      INSERT INTO security_agent_status (project_id, agent_id, agent_name, status)
+      VALUES (?, ?, ?, 'pending')
+    `);
+    for (const agent of agents) {
+      stmt.run(projectId, agent.agentId, agent.agentName);
     }
   });
-  upsert();
+  insert();
 }
 
-/**
- * Ensure all Tech seed agents exist in the database.
- * Called on app startup. Inserts agents that do not already exist.
- * For existing agents, reconciles the `system_prompt` field with the source
- * seed so that prompt updates shipped in new versions take effect on boot
- * (fix for BUG-18: previously, seed edits were silently ignored because
- * agents were only inserted once and the DB copy drifted from source).
- * Other fields (model, effort, tools, etc.) are preserved so user
- * customizations in those fields are not overwritten.
- */
-export function ensureTechAgents(): void {
-  const upsert = db.transaction(() => {
-    for (const agent of TECH_SEED_AGENTS) {
-      const existing = db
-        .prepare('SELECT id, system_prompt FROM agents WHERE id = ?')
-        .get(agent.id) as { id: string; system_prompt: string } | undefined;
-      if (!existing) {
-        insertAgent(agent);
-        logger.info({ agentId: agent.id }, 'Created tech seed agent');
-      } else if (existing.system_prompt !== agent.systemPrompt) {
-        db.prepare('UPDATE agents SET system_prompt = ? WHERE id = ?').run(
-          agent.systemPrompt,
-          agent.id
-        );
-        logger.info(
-          { agentId: agent.id },
-          'Reconciled tech seed agent system_prompt with source (BUG-18)'
-        );
-      }
-    }
+export function updateSecurityAgentStatus(
+  projectId: string,
+  agentId: string,
+  patch: Partial<Pick<SecurityAgentStatusRow, 'status' | 'findingsCount' | 'outputFile' | 'startedAt' | 'completedAt' | 'errorMessage'>>,
+): void {
+  const fields: string[] = [];
+  const values: unknown[] = [];
+
+  if (patch.status !== undefined)       { fields.push('status = ?');          values.push(patch.status); }
+  if (patch.findingsCount !== undefined) { fields.push('findings_count = ?');  values.push(patch.findingsCount); }
+  if (patch.outputFile !== undefined)   { fields.push('output_file = ?');      values.push(patch.outputFile); }
+  if (patch.startedAt !== undefined)    { fields.push('started_at = ?');       values.push(patch.startedAt); }
+  if (patch.completedAt !== undefined)  { fields.push('completed_at = ?');     values.push(patch.completedAt); }
+  if (patch.errorMessage !== undefined) { fields.push('error_message = ?');    values.push(patch.errorMessage); }
+
+  if (fields.length === 0) return;
+
+  values.push(projectId, agentId);
+  db.prepare(`
+    UPDATE security_agent_status SET ${fields.join(', ')}
+    WHERE project_id = ? AND agent_id = ?
+  `).run(...values);
+}
+
+export function getSecurityAgentStatuses(projectId: string): SecurityAgentStatusRow[] {
+  const rows = db.prepare(`
+    SELECT * FROM security_agent_status WHERE project_id = ? ORDER BY id ASC
+  `).all(projectId) as Record<string, unknown>[];
+  return rows.map(mapSecurityAgentStatus);
+}
+
+export function deleteSecurityAgentStatuses(projectId: string): void {
+  db.prepare('DELETE FROM security_agent_status WHERE project_id = ?').run(projectId);
+}
+
+export interface AuditAgentRow {
+  agentId: string;
+  agentName: string;
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  findingsCount?: number;
+  costUsd: number;
+  durationMs: number;
+  model: string | null;
+  startedAt?: string | null;
+  completedAt?: string | null;
+  toolCallsCount: number;
+}
+
+export function getAuditAgentsState(projectId: string): AuditAgentRow[] {
+  const statuses = getSecurityAgentStatuses(projectId);
+  if (statuses.length === 0) return [];
+
+  const metricsRows = db.prepare(`
+    SELECT agent_id, model, cost_usd, duration_ms, tool_uses, started_at, completed_at, status, metadata
+    FROM pipeline_phase_metrics
+    WHERE project_id = ? AND phase_number = 2 AND agent_id IS NOT NULL
+  `).all(projectId) as Array<{
+    agent_id: string;
+    model: string | null;
+    cost_usd: number;
+    duration_ms: number;
+    tool_uses: number;
+    started_at: string | null;
+    completed_at: string | null;
+    status: string;
+    metadata: string | null;
+  }>;
+
+  const metricsByAgent = new Map<string, typeof metricsRows[0]>();
+  for (const m of metricsRows) {
+    metricsByAgent.set(m.agent_id, m);
+  }
+
+  return statuses.map((s) => {
+    const m = metricsByAgent.get(s.agentId);
+    return {
+      agentId: s.agentId,
+      agentName: s.agentName,
+      status: s.status as AuditAgentRow['status'],
+      findingsCount: s.findingsCount,
+      costUsd: m?.cost_usd ?? 0,
+      durationMs: m?.duration_ms ?? 0,
+      model: m?.model ?? null,
+      startedAt: s.startedAt ?? m?.started_at ?? null,
+      completedAt: s.completedAt ?? m?.completed_at ?? null,
+      toolCallsCount: m?.tool_uses ?? 0,
+    };
   });
-  upsert();
 }
 
 // ---- Enrich Messages CRUD ----
@@ -4301,7 +4581,7 @@ export function savePipelineMessage(data: {
   phaseNumber: number;
   role: 'user' | 'assistant' | 'system';
   content: string;
-  toolCalls?: Array<{ tool: string; input: unknown }>;
+  toolCalls?: Array<{ tool: string; input: unknown; output?: string; isError?: boolean }>;
   sprintIndex?: number;
   roundIndex?: number;
   agentId?: string;
@@ -4494,6 +4774,38 @@ export function updateHarnessProjectPipelineMeta(
 }
 
 /**
+ * Read the SecuritySummary stored for a project, or null if none.
+ */
+export function getSecuritySummaryJson(projectId: string): SecuritySummary | null {
+  const row = db
+    .prepare('SELECT security_summary_json FROM harness_projects WHERE id = ?')
+    .get(projectId) as { security_summary_json: string | null } | undefined;
+  if (!row || !row.security_summary_json) return null;
+  try {
+    return JSON.parse(row.security_summary_json) as SecuritySummary;
+  } catch {
+    logger.warn({ projectId }, 'getSecuritySummaryJson: failed to parse stored JSON');
+    return null;
+  }
+}
+
+/**
+ * Patch do security_summary_json com shallow merge.
+ * Objetos aninhados (como bySeverity) sao SUBSTITUIDOS por completo, nao merged.
+ * Passe bySeverity sempre com as 4 chaves (critical/high/medium/low) populadas.
+ */
+export function patchSecuritySummaryJson(
+  projectId: string,
+  patch: Partial<SecuritySummary>,
+): void {
+  const existing = getSecuritySummaryJson(projectId) ?? {};
+  const merged: SecuritySummary = { ...existing, ...patch };
+  db.prepare(
+    `UPDATE harness_projects SET security_summary_json = ?, updated_at = datetime('now') WHERE id = ?`,
+  ).run(JSON.stringify(merged), projectId);
+}
+
+/**
  * Read all persisted messages for a specific pipeline phase.
  */
 export function getPipelinePhaseMessages(projectId: string, phaseNumber: number): Array<{
@@ -4527,6 +4839,91 @@ export function getPipelinePhaseMessages(projectId: string, phaseNumber: number)
     }
   }
   return merged;
+}
+
+/**
+ * Returns the conversation history of a pipeline phase formatted as OpenAI-compatible
+ * chat messages (multi-turn with tool_calls + tool results), for use as priorMessages
+ * in stateless external API calls.
+ *
+ * For each saved row in pipeline_messages:
+ *  - role 'user': emits a single { role: 'user', content }
+ *  - role 'assistant' with tool_calls JSON containing { tool, input, output? }:
+ *      emits { role: 'assistant', content: '', tool_calls: [...] }
+ *      followed by N { role: 'tool', tool_call_id, content: output } (when output present)
+ *      followed by { role: 'assistant', content } if the saved content is non-empty
+ *  - role 'assistant' without tool_calls: emits { role: 'assistant', content }
+ *
+ * tool_call_ids are deterministically generated from row id + index so they are stable
+ * across re-reads of the same conversation.
+ */
+export function getPipelinePhaseMessagesAsChatHistory(
+  projectId: string,
+  phaseNumber: number,
+): Array<{
+  role: 'user' | 'assistant' | 'tool';
+  content: string | null;
+  tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>;
+  tool_call_id?: string;
+}> {
+  const rows = db.prepare(`
+    SELECT id, role, content, tool_calls
+    FROM pipeline_messages
+    WHERE project_id = ? AND phase_number = ?
+    ORDER BY id ASC
+  `).all(projectId, phaseNumber) as Array<{ id: number; role: string; content: string; tool_calls: string | null }>;
+
+  const out: Array<{
+    role: 'user' | 'assistant' | 'tool';
+    content: string | null;
+    tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>;
+    tool_call_id?: string;
+  }> = [];
+
+  for (const row of rows) {
+    if (row.role === 'user') {
+      out.push({ role: 'user', content: row.content });
+      continue;
+    }
+    if (row.role !== 'assistant') continue;
+
+    const tcRaw = row.tool_calls
+      ? (JSON.parse(row.tool_calls) as Array<{ tool: string; input: unknown; output?: string; isError?: boolean }>)
+      : [];
+
+    if (tcRaw.length === 0) {
+      out.push({ role: 'assistant', content: row.content });
+      continue;
+    }
+
+    const tcWithIds = tcRaw.map((tc, idx) => ({
+      id: `call_${row.id}_${idx}`,
+      type: 'function' as const,
+      function: {
+        name: tc.tool,
+        arguments: typeof tc.input === 'string' ? tc.input : JSON.stringify(tc.input ?? {}),
+      },
+      output: tc.output,
+    }));
+
+    out.push({
+      role: 'assistant',
+      content: '',
+      tool_calls: tcWithIds.map((tc) => ({ id: tc.id, type: tc.type, function: tc.function })),
+    });
+
+    for (const tc of tcWithIds) {
+      if (tc.output !== undefined) {
+        out.push({ role: 'tool', tool_call_id: tc.id, content: tc.output });
+      }
+    }
+
+    if (row.content && row.content.trim().length > 0) {
+      out.push({ role: 'assistant', content: row.content });
+    }
+  }
+
+  return out;
 }
 
 /**
@@ -4571,9 +4968,9 @@ export function getPipelineMetrics(projectId: string): PipelineMetrics {
     WHERE project_id = ? AND runtime = 'local'
   `).get(projectId) as { local_cost: number };
 
-  // Sprint phases: coder=13, evaluator=14 (14-phase system, all per-sprint)
+  // Sprint phases: dev pipeline uses 13/14, security pipeline uses 10/11.
   const sprintPhases = mappedPhases.filter(
-    (p) => p.phaseNumber === 13 || p.phaseNumber === 14,
+    (p) => p.phaseNumber === 10 || p.phaseNumber === 11 || p.phaseNumber === 13 || p.phaseNumber === 14,
   );
 
   // Build agent_id -> display name map for all agents referenced in the metrics
@@ -4603,4 +5000,86 @@ export function getPipelineMetrics(projectId: string): PipelineMetrics {
     sprintPhases,
     agentNames,
   };
+}
+
+// =============================================================================
+// Codex Windows prep consent (V51) — SPEC-codex-windows-fix.md Camada 2
+// =============================================================================
+
+/**
+ * Versao atual da definicao de "preparar projeto pra Codex no Windows".
+ * Bumping aqui invalida consents antigos e re-pede autorizacao ao usuario.
+ *
+ * v1: git config core.autocrlf false + .gitattributes simples + renormalize
+ */
+export const CODEX_PREP_VERSION_CURRENT = 1;
+
+export interface CodexWindowsPrepConsent {
+  repoRoot: string;
+  prepVersion: number;
+  action: 'prepared' | 'skip';
+  consentedAt: number;
+  lastAppliedAt: number | null;
+}
+
+export function getCodexWindowsPrepConsent(repoRoot: string): CodexWindowsPrepConsent | null {
+  const row = db.prepare(
+    `SELECT repo_root, prep_version, action, consented_at, last_applied_at
+     FROM codex_windows_prep_consent
+     WHERE repo_root = ?`
+  ).get(repoRoot) as
+    | {
+        repo_root: string;
+        prep_version: number;
+        action: 'prepared' | 'skip';
+        consented_at: number;
+        last_applied_at: number | null;
+      }
+    | undefined;
+
+  if (!row) return null;
+
+  return {
+    repoRoot: row.repo_root,
+    prepVersion: row.prep_version,
+    action: row.action,
+    consentedAt: row.consented_at,
+    lastAppliedAt: row.last_applied_at,
+  };
+}
+
+export function upsertCodexWindowsPrepConsent(input: {
+  repoRoot: string;
+  prepVersion: number;
+  action: 'prepared' | 'skip';
+}): void {
+  const now = Date.now();
+  db.prepare(
+    `INSERT INTO codex_windows_prep_consent (repo_root, prep_version, action, consented_at, last_applied_at)
+     VALUES (?, ?, ?, ?, NULL)
+     ON CONFLICT(repo_root) DO UPDATE SET
+       prep_version = excluded.prep_version,
+       action = excluded.action,
+       consented_at = excluded.consented_at,
+       last_applied_at = NULL`
+  ).run(input.repoRoot, input.prepVersion, input.action, now);
+}
+
+export function markCodexWindowsPrepApplied(repoRoot: string): void {
+  db.prepare(
+    `UPDATE codex_windows_prep_consent
+     SET last_applied_at = ?
+     WHERE repo_root = ?`
+  ).run(Date.now(), repoRoot);
+}
+
+/**
+ * Verifica se existe pelo menos 1 agente ativo com runtime='codex' no DB.
+ * Usado pra decidir se o dialog de Windows-prep faz sentido pra este projeto.
+ */
+export function systemHasActiveCodexAgents(): boolean {
+  const row = db.prepare(
+    `SELECT COUNT(*) as c FROM agents WHERE runtime = 'codex' AND is_active = 1`
+  ).get() as { c: number };
+  return row.c > 0;
 }

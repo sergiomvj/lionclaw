@@ -57,6 +57,14 @@ async function _runDiscovery(): Promise<void> {
 
     const abortController = new AbortController();
 
+    /**
+     * EXCECAO D6 (SPEC-refactor-pipelines.md linhas 241-257):
+     * MCP discovery usa query() direto em vez de executeAgent para listar
+     * MCPs do SDK. É uma chamada de descoberta one-shot sem semântica de
+     * agente persistente.
+     *
+     * NÃO migrar para executeAgent.
+     */
     const q = query({
       prompt: 'List MCP servers',
       options: {

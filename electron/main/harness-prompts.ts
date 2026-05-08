@@ -3,6 +3,62 @@ import path from 'path';
 import type { SprintJsonEntry } from './harness-planner';
 
 /**
+ * Standardized git restrictions block injected into every coder prompt.
+ * This ensures even custom agents pulled from the DB receive the restriction,
+ * independent of what their stored systemPrompt contains.
+ *
+ * COEXISTE INTENCIONALMENTE com `seed-agents/_shared/git-restrictions.ts`
+ * (mesmo nome de export, conteudo e ponto de injecao DIFERENTES):
+ *   - este aqui (`harness-prompts.ts`)        -> injetado no USER prompt do
+ *     coder/evaluator via `appendGitRestrictionsToPrompt`. Idempotencia checa
+ *     o titulo literal "Restricoes git (CRITICO)" — alterar o titulo aqui
+ *     QUEBRA a idempotencia e duplica o bloco.
+ *   - `_shared/git-restrictions.ts`           -> interpolado no SYSTEM prompt
+ *     de seed agents que SO leem (security scanners, etc). Titulo diferente:
+ *     "Restricoes git (apenas leitura)".
+ *
+ * Se algum dia unificar: trocar `appendGitRestrictionsToPrompt` para usar
+ * o bloco do `_shared`, atualizar a string de idempotencia, e testar fluxo
+ * completo de coder/evaluator (especialmente regen, onde o prompt e injetado
+ * varias vezes).
+ */
+export const GIT_RESTRICTIONS_BLOCK = `
+## Restricoes git (CRITICO)
+
+Voce NUNCA deve executar comandos git que modifiquem state do repositorio. Os
+seguintes comandos sao PROIBIDOS sem excecao:
+
+- git commit (em qualquer forma)
+- git push (em qualquer forma)
+- git reset (--hard, --soft, --mixed)
+- git rebase, git merge
+- git rm (use Write/Edit pra deletar via filesystem)
+- git stash drop, git tag, git remote add/set-url
+- Qualquer comando com flags --force, -f
+
+Voce PODE usar comandos git somente-leitura: git status, git diff, git log,
+git show, git branch --list, git ls-files.
+
+O usuario revisa as mudancas e ele mesmo faz commit/push manualmente. Sua
+responsabilidade e EDITAR os arquivos corretamente; o controle de versao e do
+usuario, NUNCA seu.
+`.trimStart();
+
+/**
+ * Append the git restrictions block to a system prompt if not already present.
+ * Idempotent: applying twice does not duplicate the block.
+ *
+ * Used by the Harness to guarantee every coder (including custom DB agents)
+ * receives the restriction regardless of what the stored systemPrompt says.
+ */
+export function appendGitRestrictionsToPrompt(systemPrompt: string): string {
+  if (systemPrompt.includes('Restricoes git (CRITICO)')) {
+    return systemPrompt;
+  }
+  return systemPrompt.trimEnd() + '\n\n' + GIT_RESTRICTIONS_BLOCK.trim() + '\n';
+}
+
+/**
  * Build the initial prompt for the Coder agent for a sprint.
  */
 export function buildCoderPrompt(
@@ -42,7 +98,7 @@ export function buildCoderPrompt(
     }
   }
 
-  return `Voce e um desenvolvedor implementando a sprint "${sprint.name}" de um projeto.
+  const body = `Voce e um desenvolvedor implementando a sprint "${sprint.name}" de um projeto.
 
 ## Diretorio do Projeto
 ${projectPath}
@@ -77,6 +133,8 @@ ${sprint.stack.join(', ')}
    - Build (npm run build ou equivalente)
 4. Se alguma validacao falhar, corrija antes de finalizar
 5. Responda em portugues brasileiro`;
+
+  return appendGitRestrictionsToPrompt(body);
 }
 
 /**
@@ -249,7 +307,7 @@ export function buildCoderFeedbackPrompt(
   sprint: SprintJsonEntry,
   evaluatorFeedback: string,
 ): string {
-  return `O Evaluator rejeitou a implementacao anterior. Corrija os problemas abaixo:
+  const feedback = `O Evaluator rejeitou a implementacao anterior. Corrija os problemas abaixo:
 
 ## Feedback do Evaluator
 ${evaluatorFeedback}
@@ -267,4 +325,6 @@ ${sprint.features.map(f =>
 - Se receber erro de token overflow, reduza o range de leitura.
 
 Corrija os problemas e garanta que TODOS os criterios passem. Rode a validacao tecnica novamente antes de finalizar.`;
+
+  return appendGitRestrictionsToPrompt(feedback);
 }

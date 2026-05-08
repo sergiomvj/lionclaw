@@ -8,6 +8,7 @@
  */
 
 import type { AgentConfig } from '../../../src/types';
+import { GIT_RESTRICTIONS_BLOCK } from './_shared/git-restrictions';
 
 export const JAVASCRIPT_PRO_ID = 'javascript-pro';
 
@@ -53,8 +54,9 @@ export const javascriptPro: Omit<AgentConfig, 'sortOrder'> = {
 ## Regras absolutas
 
 - Codigo em ingles (variaveis, funcoes). Comunicacao em portugues brasileiro
-- NAO faca git commit ou git push
 - NAO instale dependencias sem necessidade direta
 - Siga os patterns e convencoes ja existentes no projeto
-- Prefira solucoes nativas do JS antes de adicionar bibliotecas`,
+- Prefira solucoes nativas do JS antes de adicionar bibliotecas
+
+${GIT_RESTRICTIONS_BLOCK}`,
 };

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { BarChart2 } from 'lucide-react';
-import { usePipelineStore } from '@/stores/pipeline-store';
+import { useActiveProjectState } from '@/hooks/useActiveProjectState';
 import type { PipelinePhaseMetrics } from '@/types';
 
 // ---- Formatting helpers ----
@@ -108,7 +108,11 @@ interface PipelineMetricsFooterProps {
 }
 
 export function PipelineMetricsFooter({ onExpandMetrics }: PipelineMetricsFooterProps) {
-  const { currentPhase, isStreaming, metrics, currentToolCalls, phaseMetrics: livePhaseMetrics } = usePipelineStore();
+  const currentPhase = useActiveProjectState(s => s.currentPhase) ?? null;
+  const isStreaming = useActiveProjectState(s => s.isStreaming) ?? false;
+  const metrics = useActiveProjectState(s => s.metrics) ?? null;
+  const currentToolCalls = useActiveProjectState(s => s.currentToolCalls) ?? [];
+  const livePhaseMetrics = useActiveProjectState(s => s.phaseMetrics) ?? null;
 
   // ---- Live timer ----
   // Track when streaming started so we can show elapsed H:MM:SS

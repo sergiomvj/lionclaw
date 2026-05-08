@@ -3,7 +3,8 @@ import { pathToFileURL } from 'url';
 import fs from 'fs';
 import path from 'path';
 import { autoUpdater } from 'electron-updater';
-import { initDatabase, seedToolDefaults, ensureSkillCreatorAgent, ensureHarnessAgents, ensureWorkflowAgents, ensureEnrichAgents, ensureDevAgents, ensurePipelineAgents, ensureTechAgents, getSetting } from './db';
+import { initDatabase, seedToolDefaults, getSetting } from './db';
+import { ensureAllSeedAgents } from './seed-agents/ensure';
 import { registerIPCHandlers } from './ipc-handlers';
 import { startScheduler, stopScheduler } from './scheduler';
 import { startTelegramBot, stopTelegramBot } from './telegram-bridge';
@@ -13,11 +14,12 @@ import { getExcalidrawView } from './excalidraw-views';
 import { logout } from './auth';
 import { createLogger } from './logger';
 import { getLionClawHome } from './paths';
-import { bootstrapWorkflowFiles } from './workflow-engine';
 import { startKnowledgeBridge, stopKnowledgeBridge } from './knowledge-ipc-bridge';
+import { registerExternalProviderVaultEntries } from './vault-registry';
 import { HarnessEngine } from './harness-engine';
 import { PipelineEngine } from './pipeline-engine';
 import { startIngestQueueWatcher, stopIngestQueueWatcher } from './graph-ingest';
+import { formatAppVersionLabel, getAppVersion } from './app-version';
 
 const logger = createLogger('main');
 
@@ -316,7 +318,7 @@ function ensureLionClawFiles(): void {
   const lionclawPath = getLionClawHome();
 
   // Garantir que os subdiretorios existam
-  const dirs = ['data', 'data/sessions', 'agents', 'skills', 'conversations'];
+  const dirs = ['data', 'data/sessions', 'agents', 'skills', 'conversations', 'background'];
   for (const dir of dirs) {
     fs.mkdirSync(path.join(lionclawPath, dir), { recursive: true });
   }
@@ -346,6 +348,34 @@ function ensureLionClawFiles(): void {
   if (!fs.existsSync(claudeSettingsPath)) {
     fs.writeFileSync(claudeSettingsPath, JSON.stringify({}, null, 2), 'utf-8');
     logger.info('Created empty .claude/settings.json to isolate SDK settings');
+  }
+
+  // Criar background/CLAUDE.md e background/.claude/settings.json para isolamento do subprocess
+  const bgClaudeMd = path.join(lionclawPath, 'background', 'CLAUDE.md');
+  if (!fs.existsSync(bgClaudeMd)) {
+    fs.writeFileSync(bgClaudeMd, [
+      '# LionClaw Background Agent',
+      '',
+      '> Sessao isolada para tarefas agendadas (crons) e Telegram.',
+      '',
+      '## Identidade',
+      'Voce e Alfred, executando uma tarefa agendada em background.',
+      'Responda sempre em portugues brasileiro.',
+      'Execute a tarefa silenciosamente e reporte o resultado.',
+      '',
+      '## Regras',
+      '- Execute a tarefa do prompt e encerre',
+      '- Nao inicie conversas',
+      '- Nao modifique arquivos de sistema sem confirmacao',
+      '- Nao faca git push',
+    ].join('\n'), 'utf-8');
+    logger.info('Created background/CLAUDE.md for isolated cron/telegram subprocess');
+  }
+  const bgClaudeDir = path.join(lionclawPath, 'background', '.claude');
+  fs.mkdirSync(bgClaudeDir, { recursive: true });
+  const bgSettingsPath = path.join(bgClaudeDir, 'settings.json');
+  if (!fs.existsSync(bgSettingsPath)) {
+    fs.writeFileSync(bgSettingsPath, JSON.stringify({}, null, 2), 'utf-8');
   }
 }
 
@@ -765,15 +795,11 @@ html,body,#root{width:100%;height:100%;overflow:hidden;background:#191919}
   // 1. Initialize SQLite database
   initDatabase();
   seedToolDefaults();
-  ensureSkillCreatorAgent();
-  ensureHarnessAgents();
-  ensureWorkflowAgents();
-  ensureEnrichAgents();
-  ensureDevAgents();
-  ensurePipelineAgents();
-  ensureTechAgents();
-  bootstrapWorkflowFiles();
+  await ensureAllSeedAgents();
   logger.info('Database initialized');
+
+  // Register external provider vault entries (OpenRouter, OpenAI) so they appear in the Vault UI
+  registerExternalProviderVaultEntries();
 
   // 1.5 Start Knowledge Base IPC bridge (UDS for MCP subprocess)
   // Await to guarantee socket exists before MCPs try to connect
@@ -886,7 +912,11 @@ ipcMain.handle('app:check-update', async () => {
 });
 
 ipcMain.handle('app:get-version', () => {
-  return app.getVersion();
+  const version = getAppVersion();
+  return {
+    version,
+    label: formatAppVersionLabel(version),
+  };
 });
 
 let isQuitting = false;
@@ -900,6 +930,10 @@ app.on('before-quit', async (e) => {
   stopScheduler();
   stopAllMCPServers();
   stopKnowledgeBridge();
+  try {
+    const { shutdownCodexBridge } = await import('./codex-bridge');
+    await shutdownCodexBridge();
+  } catch { /* ignore */ }
   logger.info('Cleanup complete, quitting');
   app.exit(0);
 });

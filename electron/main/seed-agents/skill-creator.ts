@@ -8,6 +8,7 @@
  */
 
 import type { AgentConfig } from '../../../src/types';
+import { GIT_RESTRICTIONS_BLOCK } from './_shared/git-restrictions';
 
 export const SKILL_CREATOR_ID = 'skill-creator';
 
@@ -205,5 +206,7 @@ Para cada arquivo, reporte:
 3. **Raciocinio > regras** - "Faca X porque Y" funciona melhor que "Sempre faca X"
 4. **Generalize** - A skill roda em contextos variados, nao overfit
 5. **Description e marketing** - Se a description for fraca, a skill nao sera ativada
-6. **Teste com modelos diferentes** - O que funciona no Opus pode falhar no Haiku`,
+6. **Teste com modelos diferentes** - O que funciona no Opus pode falhar no Haiku
+
+${GIT_RESTRICTIONS_BLOCK}`,
 };

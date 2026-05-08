@@ -5,12 +5,12 @@ import { createLogger } from './logger';
 import { insertAuditEntry } from './db';
 import { sendAskQuestion } from './ask-question';
 import type { ConfirmAction } from '../../src/types';
+import type { CanUseTool } from '@anthropic-ai/claude-agent-sdk';
+import { EXCLUDED_FROM_AUDIT_PATTERNS } from './repo-profiler';
+
+import type { ToolDecision } from './agent-runtime/types';
 
 const logger = createLogger('permission-guard');
-
-type ToolDecision =
-  | { behavior: 'allow'; updatedInput?: Record<string, unknown> }
-  | { behavior: 'deny'; message: string };
 
 interface PendingConfirmation {
   resolve: (decision: ToolDecision) => void;
@@ -27,6 +27,19 @@ const pendingConfirmations = new Map<string, PendingConfirmation>();
 const activeEnrichAllowedPaths: Set<string> = new Set();
 let activeEnrichSpecPath: string | null = null;
 
+// ---- Active Security Audit Phase flag ----
+// When a security audit is running, Read access to .env* files is blocked.
+
+let activeSecurityAuditPhase = false;
+
+export function setActiveSecurityAuditPhase(active: boolean): void {
+  activeSecurityAuditPhase = active;
+}
+
+export function isSecurityAuditPhaseActive(): boolean {
+  return activeSecurityAuditPhase;
+}
+
 export function setActiveEnrichSpecPath(specPath: string | null): void {
   activeEnrichAllowedPaths.clear();
   activeEnrichSpecPath = specPath;
@@ -42,6 +55,35 @@ export function getActiveEnrichSpecPath(): string | null {
   return activeEnrichSpecPath;
 }
 
+/**
+ * Comandos git que MUDAM state do repositorio. Sao negados DIRETAMENTE
+ * (sem modal de confirmacao) — o usuario faz controle de versao manualmente,
+ * fora do agente.
+ *
+ * Verificado antes de DESTRUCTIVE_BASH_PATTERNS pra garantir deny imediato
+ * mesmo que o pattern tambem case com checagem de confirmacao.
+ */
+const FORBIDDEN_GIT_PATTERNS: RegExp[] = [
+  /\bgit\s+commit\b/,
+  /\bgit\s+push\b/,
+  /\bgit\s+push\s+(-f|--force)\b/,
+  /\bgit\s+reset\b/,
+  /\bgit\s+rebase\b/,
+  /\bgit\s+merge\b/,
+  /\bgit\s+rm\b/,
+  /\bgit\s+stash\s+drop\b/,
+  /\bgit\s+tag\b/,
+  /\bgit\s+remote\s+(add|set-url|remove|rename)\b/,
+  /\bgit\s+fetch\s+--force\b/,
+  // git checkout -- <path> descarta mudancas locais (destrutivo).
+  // Switch de branch (git checkout main, git checkout -b new) NAO e bloqueado.
+  /\bgit\s+checkout\s+--/,
+  /\bgit\s+clean\s+-[a-z]*f/,
+];
+
+const FORBIDDEN_GIT_DENY_MESSAGE =
+  'Comandos git que modificam state (commit, push, reset, rebase, merge, etc) sao proibidos. O usuario faz controle de versao manualmente. Use Write/Edit para arquivos, e git status/diff/log para inspecao.';
+
 const DESTRUCTIVE_BASH_PATTERNS: Array<{ pattern: RegExp; risk: ConfirmAction['risk'] }> = [
   { pattern: /\brm\s+-rf?\b/, risk: 'critical' },
   { pattern: /\bsudo\b/, risk: 'critical' },
@@ -49,10 +91,7 @@ const DESTRUCTIVE_BASH_PATTERNS: Array<{ pattern: RegExp; risk: ConfirmAction['r
   { pattern: /\bmkfs\b/, risk: 'critical' },
   { pattern: /\bdd\s+if=/, risk: 'critical' },
   { pattern: /\brm\b/, risk: 'high' },
-  { pattern: /\bgit\s+push\b/, risk: 'high' },
-  { pattern: /\bgit\s+reset\s+--hard\b/, risk: 'high' },
   { pattern: /\bnpm\s+publish\b/, risk: 'high' },
-  { pattern: /\bgit\s+commit\b/, risk: 'medium' },
 ];
 
 const SENSITIVE_WRITE_PATTERNS = [/\.(env|pem|key|crt|p12)$/];
@@ -106,6 +145,20 @@ export function createPermissionGuard(getWindow: () => BrowserWindow | null, opt
       }
     }
 
+    // Block Read on .env* files during security audit phase to prevent
+    // tautological findings (reading .env and reporting secrets is not a finding).
+    if (toolName === 'Read' && activeSecurityAuditPhase) {
+      const filePath = (toolInput['file_path'] as string) || '';
+      const basename = path.basename(filePath);
+      if (EXCLUDED_FROM_AUDIT_PATTERNS.some((re) => re.test(basename))) {
+        return {
+          behavior: 'deny',
+          message:
+            'Read em .env* proibido durante auditoria. Para verificar exposicao, leia .gitignore e use Bash para \'git log -- <path>\'.',
+        };
+      }
+    }
+
     // If the tool passed SDK allowedTools filtering, auto-approve unless it needs
     // destructive pattern checks (Bash, Write, Edit, MCP tools).
     if (toolName !== 'Bash' && toolName !== 'Write' && toolName !== 'Edit' && !toolName.startsWith('mcp__')) {
@@ -115,6 +168,14 @@ export function createPermissionGuard(getWindow: () => BrowserWindow | null, opt
     // Check Bash commands for destructive patterns
     if (toolName === 'Bash') {
       const command = (toolInput['command'] as string) || '';
+      // FORBIDDEN_GIT_PATTERNS — deny direto (sem modal). Comandos git que
+      // mudam state do repo sao proibidos por politica.
+      for (const pattern of FORBIDDEN_GIT_PATTERNS) {
+        if (pattern.test(command)) {
+          logger.warn({ command }, 'Bash blocked by FORBIDDEN_GIT_PATTERNS');
+          return { behavior: 'deny', message: FORBIDDEN_GIT_DENY_MESSAGE };
+        }
+      }
       for (const { pattern, risk } of DESTRUCTIVE_BASH_PATTERNS) {
         if (pattern.test(command)) {
           return requestConfirmation(getWindow, {
@@ -265,4 +326,37 @@ export function resolveConfirmation(id: string, approved: boolean): void {
   } else {
     pending.resolve({ behavior: 'deny', message: 'Acao negada pelo usuario' });
   }
+}
+
+/**
+ * Factory que retorna um canUseTool callback pro enrich.
+ *
+ * Auto-aprova Write/Edit nos paths registrados pelo setActiveEnrichSpecPath
+ * (specPath + .validator-report.md + .enricher-suggestions.md).
+ *
+ * Para tudo o mais (Bash destrutivo, MCP destrutivo, Write/Edit em arquivos
+ * sensiveis, etc), DELEGA pro createPermissionGuard padrao. Isso preserva
+ * 100% o comportamento atual do enrich (R8 da SPEC-refactor-pipelines.md).
+ *
+ * Diferenca para createPermissionGuard padrao: o auto-approval de
+ * activeEnrichAllowedPaths roda PRIMEIRO, antes do ramo Write/Edit do guard
+ * principal. Como o guard principal tambem checa esse Set internamente, o
+ * efeito final e identico — mas explicitar aqui mantem a intencao do enrich
+ * obvia ao leitor e protege contra refactors futuros do guard padrao.
+ */
+export function createEnrichPermissionGuard(
+  getWindow: () => BrowserWindow | null,
+): CanUseTool {
+  const fallbackGuard = createPermissionGuard(getWindow);
+
+  return (async (toolName: string, toolInput: Record<string, unknown>) => {
+    if (toolName === 'Write' || toolName === 'Edit') {
+      const filePath = (toolInput['file_path'] as string) || '';
+      if (filePath && activeEnrichAllowedPaths.has(filePath)) {
+        logger.info({ tool: toolName, filePath }, 'Enrich guard: auto-approving Write/Edit on active enrich path');
+        return { behavior: 'allow', updatedInput: toolInput };
+      }
+    }
+    return fallbackGuard(toolName, toolInput);
+  }) as CanUseTool;
 }

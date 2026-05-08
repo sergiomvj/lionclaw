@@ -14,7 +14,7 @@ import {
   Trash2,
   Archive,
   Loader2,
-  BarChart3,
+  Flame,
   Shield,
   KeyRound,
   Radio,
@@ -25,6 +25,7 @@ import {
 import { useAppStore, type Page } from '@/stores/app-store';
 import { useChatStore } from '@/stores/chat-store';
 import { useAuthStore } from '@/stores/auth-store';
+import { PipelinesActiveSidebar } from './PipelinesActiveSidebar';
 
 function useSchedulerBadge() {
   const [count, setCount] = useState(0);
@@ -70,7 +71,7 @@ const navItems: NavItem[] = [
   { id: 'pipeline', label: 'Pipeline', icon: <GitBranch size={20} /> },
   { id: 'memory', label: 'Cerebro', icon: <Brain size={20} /> },
   { id: 'logs', label: 'Logs', icon: <ScrollText size={20} /> },
-  { id: 'usage', label: 'Usage', icon: <BarChart3 size={20} /> },
+  { id: 'usage', label: 'Codeburn', icon: <Flame size={20} /> },
   { id: 'permissions', label: 'Permissoes', icon: <Shield size={20} /> },
   { id: 'vault', label: 'Vault', icon: <KeyRound size={20} /> },
   { id: 'settings', label: 'Settings', icon: <Settings size={20} /> },
@@ -82,10 +83,25 @@ export function Sidebar() {
   const { onboardingCompleted } = useAuthStore();
   const schedulerBadge = useSchedulerBadge();
   const tasksBadge = useTasksBadge();
+  const [appVersionLabel, setAppVersionLabel] = useState('');
 
   const computedNavItems = navItems;
 
   const showSessions = currentPage === 'chat' && !sidebarCollapsed;
+
+  useEffect(() => {
+    let mounted = true;
+    window.lionclaw.app.getVersion()
+      .then((info) => {
+        if (mounted) setAppVersionLabel(info.label);
+      })
+      .catch(() => {
+        if (mounted) setAppVersionLabel('');
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   return (
     <aside
@@ -266,6 +282,9 @@ export function Sidebar() {
         </div>
       )}
 
+      {/* Active pipelines summary */}
+      {!sidebarCollapsed && <PipelinesActiveSidebar />}
+
       {/* Spacer when no sessions shown */}
       {!showSessions && <div className="flex-1" />}
 
@@ -284,9 +303,9 @@ export function Sidebar() {
       )}
 
       {/* Footer */}
-      {!sidebarCollapsed && (
+      {!sidebarCollapsed && appVersionLabel && (
         <div className="px-4 py-3 text-xs text-zinc-600 border-t border-zinc-800">
-          v2.1.1
+          {appVersionLabel}
         </div>
       )}
     </aside>

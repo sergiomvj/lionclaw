@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
-import { KeyRound, Eye, EyeOff, Check, Trash2, ExternalLink, ShieldCheck, ShieldAlert } from 'lucide-react';
+import { KeyRound, Eye, EyeOff, Check, Trash2, ExternalLink, ShieldCheck, ShieldAlert, Wifi } from 'lucide-react';
+import { PROVIDER_PRESETS } from '@/lib/provider-presets';
 
 interface VaultEntry {
   key: string;
@@ -12,12 +13,22 @@ interface VaultEntry {
   docsUrl?: string;
 }
 
+// Services that map to testable external providers.
+const TESTABLE_SERVICES: Record<string, string> = {
+  openrouter: 'openrouter',
+  'openai-harness': 'openai',
+};
+
+type TestState = 'idle' | 'testing' | 'ok' | 'error';
+
 export default function VaultPage() {
   const [entries, setEntries] = useState<VaultEntry[]>([]);
   const [editingKey, setEditingKey] = useState<string | null>(null);
   const [inputValue, setInputValue] = useState('');
   const [showValue, setShowValue] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [testStates, setTestStates] = useState<Map<string, TestState>>(new Map());
+  const [testErrors, setTestErrors] = useState<Map<string, string>>(new Map());
 
   useEffect(() => {
     loadEntries();
@@ -51,6 +62,34 @@ export default function VaultPage() {
     setEditingKey(key);
     setInputValue('');
     setShowValue(false);
+  };
+
+  const handleTestConnection = async (entry: VaultEntry) => {
+    const providerName = TESTABLE_SERVICES[entry.service];
+    if (!providerName) return;
+
+    const preset = PROVIDER_PRESETS[providerName];
+    if (!preset) return;
+
+    setTestStates((prev) => new Map(prev).set(entry.key, 'testing'));
+    setTestErrors((prev) => {
+      const next = new Map(prev);
+      next.delete(entry.key);
+      return next;
+    });
+
+    const result = await window.lionclaw.provider.testConnection(
+      providerName,
+      preset.baseUrl,
+      entry.key,
+    );
+
+    if (result.ok) {
+      setTestStates((prev) => new Map(prev).set(entry.key, 'ok'));
+    } else {
+      setTestStates((prev) => new Map(prev).set(entry.key, 'error'));
+      setTestErrors((prev) => new Map(prev).set(entry.key, result.error));
+    }
   };
 
   return (
@@ -137,25 +176,47 @@ export default function VaultPage() {
                   </button>
                 </div>
               ) : (
-                <div className="flex items-center gap-2">
-                  <button
-                    onClick={() => startEditing(entry.key)}
-                    className="text-xs px-3 py-1.5 rounded-lg bg-zinc-700 hover:bg-zinc-600 text-zinc-300 transition-colors"
-                  >
-                    {entry.configured ? 'Alterar' : 'Configurar'}
-                  </button>
-                  {entry.configured && !entry.required && (
+                <div className="flex flex-col gap-2">
+                  <div className="flex items-center gap-2">
                     <button
-                      onClick={() => handleDelete(entry.key)}
-                      className="text-xs px-2 py-1.5 rounded-lg text-red-400 hover:bg-red-500/10 transition-colors"
+                      onClick={() => startEditing(entry.key)}
+                      className="text-xs px-3 py-1.5 rounded-lg bg-zinc-700 hover:bg-zinc-600 text-zinc-300 transition-colors"
                     >
-                      <Trash2 size={12} />
+                      {entry.configured ? 'Alterar' : 'Configurar'}
                     </button>
-                  )}
-                  {entry.configured && (
-                    <span className="text-xs text-green-500/70 ml-2 flex items-center gap-1">
-                      <Check size={12} /> Configurada
-                    </span>
+                    {entry.configured && !entry.required && (
+                      <button
+                        onClick={() => handleDelete(entry.key)}
+                        className="text-xs px-2 py-1.5 rounded-lg text-red-400 hover:bg-red-500/10 transition-colors"
+                      >
+                        <Trash2 size={12} />
+                      </button>
+                    )}
+                    {entry.configured && TESTABLE_SERVICES[entry.service] && (
+                      <button
+                        onClick={() => handleTestConnection(entry)}
+                        disabled={testStates.get(entry.key) === 'testing'}
+                        className="text-xs px-3 py-1.5 rounded-lg bg-zinc-700 hover:bg-zinc-600 text-zinc-300 transition-colors flex items-center gap-1.5 disabled:opacity-50"
+                      >
+                        <Wifi size={12} />
+                        {testStates.get(entry.key) === 'testing' ? 'Testando...' : 'Testar conexao'}
+                      </button>
+                    )}
+                    {entry.configured && (
+                      <span className="text-xs text-green-500/70 ml-2 flex items-center gap-1">
+                        <Check size={12} /> Configurada
+                      </span>
+                    )}
+                    {testStates.get(entry.key) === 'ok' && (
+                      <span className="text-xs text-green-400 flex items-center gap-1">
+                        <Check size={12} /> Conexao OK
+                      </span>
+                    )}
+                  </div>
+                  {testStates.get(entry.key) === 'error' && (
+                    <p className="text-xs text-red-400 bg-red-500/10 rounded px-2 py-1">
+                      {testErrors.get(entry.key) ?? 'Erro ao testar conexao'}
+                    </p>
                   )}
                 </div>
               )}

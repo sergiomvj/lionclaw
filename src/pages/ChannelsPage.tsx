@@ -16,7 +16,7 @@ interface ChannelCardProps {
   testResult?: { success: boolean; botUsername?: string; error?: string } | null;
 }
 
-function ChannelCard({ type, name, icon, channel, comingSoon, onConfigure, onToggle, onTest, testing, testResult }: ChannelCardProps) {
+function ChannelCard({ type: _type, name, icon, channel, comingSoon, onConfigure, onToggle, onTest, testing, testResult }: ChannelCardProps) {
   const isActive = channel?.isActive ?? false;
   const status = channel?.status ?? 'disconnected';
   const isConfigured = !!channel;

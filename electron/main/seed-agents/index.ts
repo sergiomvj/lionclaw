@@ -1,9 +1,9 @@
 /**
- * Seed agents for the Agent Harness and BuildPlan Workflow features.
+ * Seed agents for the Agent Harness and pipeline SPEC features.
  *
  * These agents ship with LionClaw and are created on first boot.
  * The user can edit them freely after creation (model, prompt, tools, etc).
- * If deleted, they can be re-created by calling ensureHarnessAgents() / ensureWorkflowAgents().
+ * If deleted, they can be re-created by calling ensureHarnessAgents() / ensurePipelineSpecAgents().
  */
 
 // ---- Harness Agents ----
@@ -28,7 +28,7 @@ export const HARNESS_SEED_AGENTS = [
   harnessEvaluator,
 ];
 
-// ---- Workflow (BuildPlan) Agents ----
+// ---- Pipeline SPEC Agents (used by dev/security pipelines) ----
 
 export { specBuilder, SPEC_BUILDER_ID } from './spec-builder';
 export { specValidator, SPEC_VALIDATOR_ID } from './spec-validator';
@@ -36,12 +36,12 @@ export { specValidator, SPEC_VALIDATOR_ID } from './spec-validator';
 import { specBuilder, SPEC_BUILDER_ID } from './spec-builder';
 import { specValidator, SPEC_VALIDATOR_ID } from './spec-validator';
 
-export const WORKFLOW_AGENT_IDS = [
+export const PIPELINE_SPEC_AGENT_IDS = [
   SPEC_BUILDER_ID,
   SPEC_VALIDATOR_ID,
 ] as const;
 
-export const WORKFLOW_SEED_AGENTS = [
+export const PIPELINE_SPEC_SEED_AGENTS = [
   specBuilder,
   specValidator,
 ];
@@ -120,9 +120,67 @@ export const TECH_SEED_AGENTS = [
 
 export { skillCreator, SKILL_CREATOR_ID } from './skill-creator';
 
-import { skillCreator, SKILL_CREATOR_ID } from './skill-creator';
+import { skillCreator } from './skill-creator';
 
 export const SKILL_CREATOR_AGENTS = [skillCreator];
+
+// ---- Security Agents ----
+
+export { repoProfiler, REPO_PROFILER_ID } from './repo-profiler';
+export { securitySecretsScanner, SECRETS_SCANNER_ID } from './security-secrets-scanner';
+export { securityAuthAuditor, AUTH_AUDITOR_ID } from './security-auth-auditor';
+export { securityIsolationInspector, ISOLATION_INSPECTOR_ID } from './security-isolation-inspector';
+export { securityDuplicationDetector, DUPLICATION_DETECTOR_ID } from './security-duplication-detector';
+export { securityLogicAnalyzer, LOGIC_ANALYZER_ID } from './security-logic-analyzer';
+export { securityStandardsChecker, STANDARDS_CHECKER_ID } from './security-standards-checker';
+export { securityOwaspScanner, OWASP_SCANNER_ID } from './security-owasp-scanner';
+export { securityDeduplicator, SECURITY_DEDUPLICATOR_ID } from './security-deduplicator';
+export { securitySkepticSecurity, SECURITY_SKEPTIC_SECURITY_ID } from './security-skeptic-security';
+export { securitySkepticQuality, SECURITY_SKEPTIC_QUALITY_ID } from './security-skeptic-quality';
+export { securityResolutionTracker, RESOLUTION_TRACKER_ID } from './security-resolution-tracker';
+
+import { repoProfiler, REPO_PROFILER_ID } from './repo-profiler';
+import { securitySecretsScanner, SECRETS_SCANNER_ID } from './security-secrets-scanner';
+import { securityAuthAuditor, AUTH_AUDITOR_ID } from './security-auth-auditor';
+import { securityIsolationInspector, ISOLATION_INSPECTOR_ID } from './security-isolation-inspector';
+import { securityDuplicationDetector, DUPLICATION_DETECTOR_ID } from './security-duplication-detector';
+import { securityLogicAnalyzer, LOGIC_ANALYZER_ID } from './security-logic-analyzer';
+import { securityStandardsChecker, STANDARDS_CHECKER_ID } from './security-standards-checker';
+import { securityOwaspScanner, OWASP_SCANNER_ID } from './security-owasp-scanner';
+import { securityDeduplicator, SECURITY_DEDUPLICATOR_ID } from './security-deduplicator';
+import { securitySkepticSecurity, SECURITY_SKEPTIC_SECURITY_ID } from './security-skeptic-security';
+import { securitySkepticQuality, SECURITY_SKEPTIC_QUALITY_ID } from './security-skeptic-quality';
+import { securityResolutionTracker, RESOLUTION_TRACKER_ID } from './security-resolution-tracker';
+
+export const SECURITY_AGENT_IDS = [
+  REPO_PROFILER_ID,
+  SECRETS_SCANNER_ID,
+  AUTH_AUDITOR_ID,
+  ISOLATION_INSPECTOR_ID,
+  DUPLICATION_DETECTOR_ID,
+  LOGIC_ANALYZER_ID,
+  STANDARDS_CHECKER_ID,
+  OWASP_SCANNER_ID,
+  SECURITY_DEDUPLICATOR_ID,
+  SECURITY_SKEPTIC_SECURITY_ID,
+  SECURITY_SKEPTIC_QUALITY_ID,
+  RESOLUTION_TRACKER_ID,
+] as const;
+
+export const SECURITY_SEED_AGENTS = [
+  repoProfiler,
+  securitySecretsScanner,
+  securityAuthAuditor,
+  securityIsolationInspector,
+  securityDuplicationDetector,
+  securityLogicAnalyzer,
+  securityStandardsChecker,
+  securityOwaspScanner,
+  securityDeduplicator,
+  securitySkepticSecurity,
+  securitySkepticQuality,
+  securityResolutionTracker,
+];
 
 // ---- Dev Agents ----
 
@@ -152,4 +210,72 @@ export const DEV_SEED_AGENTS = [
   electronPro,
   javascriptPro,
   nextjsDeveloper,
+];
+
+// ---- Feature Agents ----
+
+export { featDiscovery, FEAT_DISCOVERY_ID } from './feat-discovery';
+export { featPrdGenerator, FEAT_PRD_GENERATOR_ID } from './feat-prd-generator';
+export { featPrdValidator, FEAT_PRD_VALIDATOR_ID } from './feat-prd-validator';
+export { featPrdCompleto, FEAT_PRD_COMPLETO_ID } from './feat-prd-completo';
+export { featTechDatabase, FEAT_TECH_DATABASE_ID } from './feat-tech-database';
+export { featTechBackend, FEAT_TECH_BACKEND_ID } from './feat-tech-backend';
+export { featTechFrontend, FEAT_TECH_FRONTEND_ID } from './feat-tech-frontend';
+export { featTechSecurity, FEAT_TECH_SECURITY_ID } from './feat-tech-security';
+
+import { featDiscovery, FEAT_DISCOVERY_ID } from './feat-discovery';
+import { featPrdGenerator, FEAT_PRD_GENERATOR_ID } from './feat-prd-generator';
+import { featPrdValidator, FEAT_PRD_VALIDATOR_ID } from './feat-prd-validator';
+import { featPrdCompleto, FEAT_PRD_COMPLETO_ID } from './feat-prd-completo';
+import { featTechDatabase, FEAT_TECH_DATABASE_ID } from './feat-tech-database';
+import { featTechBackend, FEAT_TECH_BACKEND_ID } from './feat-tech-backend';
+import { featTechFrontend, FEAT_TECH_FRONTEND_ID } from './feat-tech-frontend';
+import { featTechSecurity, FEAT_TECH_SECURITY_ID } from './feat-tech-security';
+
+export const FEATURE_AGENT_IDS = [
+  FEAT_DISCOVERY_ID,
+  FEAT_PRD_GENERATOR_ID,
+  FEAT_PRD_VALIDATOR_ID,
+  FEAT_PRD_COMPLETO_ID,
+  FEAT_TECH_DATABASE_ID,
+  FEAT_TECH_BACKEND_ID,
+  FEAT_TECH_FRONTEND_ID,
+  FEAT_TECH_SECURITY_ID,
+] as const;
+
+export const FEATURE_SEED_AGENTS = [
+  featDiscovery,
+  featPrdGenerator,
+  featPrdValidator,
+  featPrdCompleto,
+  featTechDatabase,
+  featTechBackend,
+  featTechFrontend,
+  featTechSecurity,
+];
+
+// ---- Architecture Review Agents ----
+
+export { architectureMapper, ARCHITECTURE_MAPPER_ID } from './architecture-mapper';
+export { architectureTargetTriage, ARCHITECTURE_TARGET_TRIAGE_ID } from './architecture-target-triage';
+export { architectureDiagnostician, ARCHITECTURE_DIAGNOSTICIAN_ID } from './architecture-diagnostician';
+export { architectureDecisionInterviewer, ARCHITECTURE_DECISION_INTERVIEWER_ID } from './architecture-decision-interviewer';
+
+import { architectureMapper, ARCHITECTURE_MAPPER_ID } from './architecture-mapper';
+import { architectureTargetTriage, ARCHITECTURE_TARGET_TRIAGE_ID } from './architecture-target-triage';
+import { architectureDiagnostician, ARCHITECTURE_DIAGNOSTICIAN_ID } from './architecture-diagnostician';
+import { architectureDecisionInterviewer, ARCHITECTURE_DECISION_INTERVIEWER_ID } from './architecture-decision-interviewer';
+
+export const ARCHITECTURE_REVIEW_AGENT_IDS = [
+  ARCHITECTURE_MAPPER_ID,
+  ARCHITECTURE_TARGET_TRIAGE_ID,
+  ARCHITECTURE_DIAGNOSTICIAN_ID,
+  ARCHITECTURE_DECISION_INTERVIEWER_ID,
+] as const;
+
+export const ARCHITECTURE_REVIEW_SEED_AGENTS = [
+  architectureMapper,
+  architectureTargetTriage,
+  architectureDiagnostician,
+  architectureDecisionInterviewer,
 ];

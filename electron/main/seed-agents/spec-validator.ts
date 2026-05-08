@@ -1,5 +1,5 @@
 /**
- * Seed agent config for the Workflow Spec Validator.
+ * Seed agent config for the Spec Validator (used by dev/feature/security pipelines).
  *
  * Role: Recebe discovery-notes.md + SPEC.md e valida completude e consistencia.
  * Gera validation-report.md com [MISS], [CONFLICT] ou [OK].
@@ -29,7 +29,8 @@ export const specValidator: Omit<AgentConfig, 'sortOrder'> = {
   isActive: true,
   skills: [],
   runtime: 'cloud' as const,
-  systemPrompt: `Voce e o Spec Validator do LionClaw BuildPlan workflow.
+  squad: 'pipeline',
+  systemPrompt: `Voce e o Spec Validator usado pelos pipelines do LionClaw.
 
 ## Seu papel
 

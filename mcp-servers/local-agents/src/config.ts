@@ -12,13 +12,22 @@ export interface LocalAgentConfig {
   systemPrompt: string;
   allowedTools: string[];
   isActive: boolean;
-  runtime: 'cloud' | 'local';
+  runtime: 'cloud' | 'local' | 'external';
   localConfig?: {
     provider: 'ollama' | 'lmstudio' | 'openai-compatible';
     baseUrl: string;
     model: string;
     temperature?: number;
     maxTokens?: number;
+  };
+  externalConfig?: {
+    provider: 'openrouter' | 'openai' | 'openai-compatible';
+    baseUrl: string;
+    model: string;
+    apiKeyRef: string;
+    temperature?: number;
+    maxTokens?: number;
+    extraHeaders?: Record<string, string>;
   };
   localMode: 'simple' | 'smart';
   maxToolRounds: number;
@@ -58,18 +67,18 @@ export function loadAgentConfig(agentId: string): LocalAgentConfig | null {
       systemPrompt: row['system_prompt'] as string,
       allowedTools: JSON.parse((row['allowed_tools'] as string) || '[]'),
       isActive: (row['is_active'] as number) === 1,
-      runtime: (row['runtime'] as 'cloud' | 'local') || 'cloud',
+      runtime: (row['runtime'] as 'cloud' | 'local' | 'external') || 'cloud',
       localConfig: row['local_config'] ? JSON.parse(row['local_config'] as string) : undefined,
+      externalConfig: row['external_config'] ? JSON.parse(row['external_config'] as string) : undefined,
       localMode: (row['local_mode'] as 'simple' | 'smart') || 'simple',
       maxToolRounds: (row['max_tool_rounds'] as number) || 5,
     };
 
-    if (config.runtime !== 'local' || !config.localConfig) {
-      logger.warn({ agentId }, 'Agent is not a local agent');
-      return null;
-    }
+    if (config.runtime === 'local' && config.localConfig) return config;
+    if (config.runtime === 'external' && config.externalConfig) return config;
 
-    return config;
+    logger.warn({ agentId, runtime: config.runtime }, 'Agent is not a local or external agent');
+    return null;
   } catch (err) {
     logger.error({ err, agentId }, 'Failed to load agent config');
     return null;
@@ -106,6 +115,32 @@ export function loadAllLocalAgents(): LocalAgentConfig[] {
     })).filter((a) => a.localConfig);
   } catch (err) {
     logger.error({ err }, 'Failed to load local agents');
+    return [];
+  }
+}
+
+export function loadAllExternalAgents(): LocalAgentConfig[] {
+  try {
+    const database = getDb();
+    const rows = database.prepare(
+      "SELECT * FROM agents WHERE is_active = 1 AND runtime = 'external'"
+    ).all() as Record<string, unknown>[];
+
+    return rows.map((row) => ({
+      id: row['id'] as string,
+      name: row['name'] as string,
+      description: row['description'] as string,
+      systemPrompt: row['system_prompt'] as string,
+      allowedTools: JSON.parse((row['allowed_tools'] as string) || '[]'),
+      isActive: true,
+      runtime: 'external' as const,
+      localConfig: undefined,
+      externalConfig: row['external_config'] ? JSON.parse(row['external_config'] as string) : undefined,
+      localMode: (row['local_mode'] as 'simple' | 'smart') || 'simple',
+      maxToolRounds: (row['max_tool_rounds'] as number) || 5,
+    })).filter((a) => a.externalConfig);
+  } catch (err) {
+    logger.error({ err }, 'Failed to load external agents');
     return [];
   }
 }

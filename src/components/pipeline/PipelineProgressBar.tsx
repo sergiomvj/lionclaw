@@ -1,6 +1,5 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { Check, X, Minus, RotateCcw } from 'lucide-react';
-import { PIPELINE_PHASES } from '@/types';
 import type { PhaseDefinition, PipelinePhaseMetrics } from '@/types';
 import { usePipelineStore } from '@/stores/pipeline-store';
 import { TechGroup } from './TechGroup';
@@ -144,17 +143,10 @@ function PhaseTooltip({ phase, metrics, status }: PhaseTooltipProps) {
   );
 }
 
-// ---- Tech phase numbers (grouped into TechGroup) ----
-
-const TECH_PHASE_NUMBERS = new Set([5, 6, 7, 8]);
-
-// ---- Stage group label ----
-
-const STAGE_NAMES = ['Discovery', 'PRD', 'Spec', 'Execution'];
-
 // ---- Main component ----
 
 interface PipelineProgressBarProps {
+  phases: PhaseDefinition[];
   currentPhase: number | null;
   phaseStatus: string;
   phaseMetrics?: PipelinePhaseMetrics[];
@@ -163,6 +155,7 @@ interface PipelineProgressBarProps {
 }
 
 export function PipelineProgressBar({
+  phases,
   currentPhase,
   phaseStatus,
   phaseMetrics = [],
@@ -177,24 +170,47 @@ export function PipelineProgressBar({
     phaseMetrics.map((m) => [m.phaseNumber, m])
   );
 
-  // Group phases by stage for label rendering (stages 1-4, keeping original logic)
-  const stages = [1, 2, 3, 4].map((stageNum) => ({
-    stageNum,
-    stageName: STAGE_NAMES[stageNum - 1],
-    phases: PIPELINE_PHASES.filter((p) => p.stage === stageNum),
-  }));
+  // Derive stage groups dynamically from the phases array
+  const stages = useMemo(() => {
+    const stageMap = new Map<number, { stageName: string; phases: PhaseDefinition[] }>();
+    for (const phase of phases) {
+      if (!stageMap.has(phase.stage)) {
+        stageMap.set(phase.stage, { stageName: phase.stageName, phases: [] });
+      }
+      stageMap.get(phase.stage)!.phases.push(phase);
+    }
+    return Array.from(stageMap.entries()).map(([stageNum, data]) => ({
+      stageNum,
+      stageName: data.stageName,
+      phases: data.phases,
+    }));
+  }, [phases]);
 
-  // Tech phases (5-8) rendered as TechGroup
-  const techPhases = PIPELINE_PHASES.filter((p) => TECH_PHASE_NUMBERS.has(p.number));
+  // Collect phases by groupId so the bar can render each distinct group as a
+  // collapsible badge. Any phase without groupId renders individually.
+  const groupedPhases = useMemo(() => {
+    const map = new Map<string, { label: string; phases: PhaseDefinition[] }>();
+    for (const p of phases) {
+      if (!p.groupId) continue;
+      const label = p.groupLabel ?? p.groupId.toUpperCase();
+      const entry = map.get(p.groupId) ?? { label, phases: [] };
+      entry.phases.push(p);
+      map.set(p.groupId, entry);
+    }
+    return map;
+  }, [phases]);
 
-  // Non-tech individual phases: all phases except 5-8
-  const individualPhases = PIPELINE_PHASES.filter((p) => !TECH_PHASE_NUMBERS.has(p.number));
-
-  // Resolve overall status of the tech group for connector coloring
-  const techGroupCompleted = techPhases.every((p) => {
-    const s = resolvePhaseDisplayStatus(p.number, currentPhase, phaseStatus, metricsMap);
-    return s === 'completed' || s === 'skipped';
-  });
+  // Resolve overall status per group for connector coloring
+  const groupCompleted = useMemo(() => {
+    const result: Record<string, boolean> = {};
+    for (const [groupId, data] of groupedPhases) {
+      result[groupId] = data.phases.every((p) => {
+        const s = resolvePhaseDisplayStatus(p.number, currentPhase, phaseStatus, metricsMap);
+        return s === 'completed' || s === 'skipped';
+      });
+    }
+    return result;
+  }, [groupedPhases, currentPhase, phaseStatus, metricsMap]);
 
   // Handle phase badge click: toggle history view (UI-17)
   const handlePhaseBadgeClick = (phaseNumber: number, isCompleted: boolean, isCurrentPhase: boolean) => {
@@ -208,8 +224,8 @@ export function PipelineProgressBar({
     }
   };
 
-  // Handle tech group phase selection
-  const handleTechPhaseSelect = (phaseNumber: number) => {
+  // Handle group sub-phase selection (shared by all groups)
+  const handleGroupPhaseSelect = (phaseNumber: number) => {
     if (onPhaseClick) onPhaseClick(phaseNumber);
     if (activeProjectId) {
       setViewingPhase(phaseNumber);
@@ -217,27 +233,31 @@ export function PipelineProgressBar({
     }
   };
 
-  // Build the sequence of renderable items:
-  // individual phase items and one tech-group item at the position of phase 5
-  // We interleave them preserving numeric order: 1,2,3,4,[TECH],9,10,11,12,13,14
+  // Build the sequence of renderable items.
+  // Insert one 'group' item at the position of the first phase belonging to that group.
   type BarItem =
     | { kind: 'phase'; phase: PhaseDefinition }
-    | { kind: 'tech' };
+    | { kind: 'group'; groupId: string; label: string; phases: PhaseDefinition[] };
 
-  const barItems: BarItem[] = [];
-  let techInserted = false;
-
-  for (const phase of PIPELINE_PHASES) {
-    if (TECH_PHASE_NUMBERS.has(phase.number)) {
-      if (!techInserted) {
-        barItems.push({ kind: 'tech' });
-        techInserted = true;
-      }
-      // Skip individual rendering of tech phases
-      continue;
+  const barItems = useMemo((): BarItem[] => {
+    if (groupedPhases.size === 0) {
+      return phases.map((phase) => ({ kind: 'phase' as const, phase }));
     }
-    barItems.push({ kind: 'phase', phase });
-  }
+    const inserted = new Set<string>();
+    const items: BarItem[] = [];
+    for (const phase of phases) {
+      if (phase.groupId) {
+        if (!inserted.has(phase.groupId)) {
+          const data = groupedPhases.get(phase.groupId)!;
+          items.push({ kind: 'group', groupId: phase.groupId, label: data.label, phases: data.phases });
+          inserted.add(phase.groupId);
+        }
+        continue;
+      }
+      items.push({ kind: 'phase', phase });
+    }
+    return items;
+  }, [phases, groupedPhases]);
 
   return (
     <div className="border-b border-zinc-800 bg-zinc-950/80 px-4 py-3 shrink-0">
@@ -264,28 +284,31 @@ export function PipelineProgressBar({
         {barItems.map((item, idx) => {
           const isLast = idx === barItems.length - 1;
 
-          if (item.kind === 'tech') {
-            // Determine connector completed state: phase before (4) and phase after (9)
-            const prevPhase = individualPhases.find((p) => p.number === 4);
-            const nextPhase = individualPhases.find((p) => p.number === 9);
-            const prevCompleted = prevPhase
-              ? resolvePhaseDisplayStatus(prevPhase.number, currentPhase, phaseStatus, metricsMap) === 'completed'
-              : false;
-            const nextCompleted = nextPhase
-              ? resolvePhaseDisplayStatus(nextPhase.number, currentPhase, phaseStatus, metricsMap) === 'completed'
-              : false;
+          if (item.kind === 'group') {
+            // Determine connector completed state: look at the next bar item
+            const nextItemForGroup = barItems[idx + 1];
+            let nextCompletedForGroup = false;
+            if (nextItemForGroup) {
+              if (nextItemForGroup.kind === 'phase') {
+                nextCompletedForGroup =
+                  resolvePhaseDisplayStatus(nextItemForGroup.phase.number, currentPhase, phaseStatus, metricsMap) === 'completed';
+              } else {
+                nextCompletedForGroup = groupCompleted[nextItemForGroup.groupId] ?? false;
+              }
+            }
 
             return (
-              <div key="tech-group" className="flex items-center">
+              <div key={`group-${item.groupId}`} className="flex items-center">
                 <TechGroup
-                  phases={techPhases}
+                  phases={item.phases}
                   currentPhase={currentPhase}
                   phaseStatus={phaseStatus}
                   metricsMap={metricsMap}
-                  onSelectPhase={handleTechPhaseSelect}
+                  onSelectPhase={handleGroupPhaseSelect}
+                  groupLabel={item.label}
                 />
                 {!isLast && (
-                  <PhaseConnector completed={techGroupCompleted && nextCompleted} />
+                  <PhaseConnector completed={(groupCompleted[item.groupId] ?? false) && nextCompletedForGroup} />
                 )}
               </div>
             );
@@ -309,8 +332,7 @@ export function PipelineProgressBar({
               nextCompleted =
                 resolvePhaseDisplayStatus(nextItem.phase.number, currentPhase, phaseStatus, metricsMap) === 'completed';
             } else {
-              // Next item is the tech group
-              nextCompleted = techGroupCompleted;
+              nextCompleted = groupCompleted[nextItem.groupId] ?? false;
             }
           }
 

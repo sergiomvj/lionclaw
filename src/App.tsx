@@ -1,8 +1,9 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 import { Sidebar } from '@/components/common/Sidebar';
 import { useAppStore } from '@/stores/app-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useChatStore } from '@/stores/chat-store';
+import { usePipelineStore } from '@/stores/pipeline-store';
 import { ChatPage } from '@/pages/ChatPage';
 import { SettingsPage } from '@/pages/SettingsPage';
 import { AuthPage } from '@/pages/AuthPage';
@@ -27,7 +28,9 @@ export function App() {
   const { isAuthenticated, isFirstRun, isLoading, checkAuth, onboardingCompleted, checkOnboarding } = useAuthStore();
   const { currentPage, setPage } = useAppStore();
   const { handleStreamChunk, loadSessions } = useChatStore();
+  const { init: pipelineInit } = usePipelineStore();
   const [confirmAction, setConfirmAction] = useState<ConfirmAction | null>(null);
+  const pipelineCleanupRef = useRef<(() => void) | null>(null);
 
   useEffect(() => {
     checkAuth();
@@ -53,6 +56,16 @@ export function App() {
       setPage('chat');
     }
   }, [isAuthenticated, onboardingCompleted, setPage]);
+
+  // Register pipeline IPC listeners once at app-level so stream chunks are
+  // never lost when the user navigates away from PipelinePage.
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    if (pipelineCleanupRef.current) return; // already registered
+    const cleanup = pipelineInit();
+    pipelineCleanupRef.current = cleanup;
+    // No return cleanup: listeners persist for the app lifetime.
+  }, [isAuthenticated, pipelineInit]);
 
   // Subscribe to chat stream events
   useEffect(() => {

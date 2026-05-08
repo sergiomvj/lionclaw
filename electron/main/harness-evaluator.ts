@@ -1,6 +1,8 @@
 import fs from 'fs';
 import path from 'path';
+import { jsonrepair } from 'jsonrepair';
 import { createLogger } from './logger';
+import { extractBalancedJsonObjectCandidates } from './json-extractor';
 import type { EvaluationResult, EvaluationCriterion } from '../../src/types';
 import type { SprintJsonEntry } from './harness-planner';
 
@@ -13,6 +15,7 @@ const logger = createLogger('harness-evaluator');
 export function buildEvaluatorPrompt(
   sprintJson: SprintJsonEntry,
   projectPath: string,
+  specPath: string,
 ): string {
   const criteriaBlock = sprintJson.features.map(f => {
     const criteria = f.acceptance_criteria.map((c, i) =>
@@ -23,6 +26,9 @@ export function buildEvaluatorPrompt(
 
   return `## Diretorio do Projeto
 ${projectPath}
+
+## Caminho da SPEC (use este caminho exato — NAO procure por SPEC.md no root)
+${specPath}
 
 ## Sprint: ${sprintJson.name}
 ${sprintJson.description}
@@ -56,38 +62,93 @@ REGRAS DO SCHEMA:
 
 /**
  * Parse the Evaluator's JSON output, validating structure.
+ *
+ * @param rawOutput   - Raw text from the evaluator agent.
+ * @param roundNumber - Current round number (used for logging).
+ * @param outMeta     - Optional out-param; if provided and jsonrepair was needed,
+ *                      sets `outMeta.repaired = true` so callers can report the
+ *                      correct tier ('jsonrepair') in telemetry.
  */
-export function parseEvaluationOutput(rawOutput: string, roundNumber: number): EvaluationResult {
+export function parseEvaluationOutput(
+  rawOutput: string,
+  roundNumber: number,
+  outMeta?: { repaired?: boolean },
+): EvaluationResult {
   let jsonStr = rawOutput.trim();
 
   if (!jsonStr) {
     throw new Error('Evaluator returned empty output. The agent may have only used tools without producing a final JSON response.');
   }
 
-  // Handle markdown code blocks
+  // Handle markdown code blocks (strip them first, then search for candidates)
   const jsonBlockMatch = jsonStr.match(/```(?:json)?\s*\n?([\s\S]*?)\n?```/);
   if (jsonBlockMatch) {
     jsonStr = jsonBlockMatch[1].trim();
   }
 
-  // Find JSON object
-  const jsonObjMatch = jsonStr.match(/\{[\s\S]*\}/);
-  if (jsonObjMatch) {
-    jsonStr = jsonObjMatch[0];
-  } else {
-    throw new Error(`Evaluator output contains no JSON object. Raw output (first 500 chars): ${rawOutput.slice(0, 500)}`);
+  // Collect all top-level balanced JSON object candidates.
+  // Evaluate them from last to first: Opus typically produces analysis text
+  // before the final JSON, so the real evaluation object is near the end.
+  const candidates = extractBalancedJsonObjectCandidates(jsonStr);
+  if (candidates.length === 0) {
+    throw new Error(
+      `Evaluator output contains no JSON object. Raw output (first 500 chars): ${rawOutput.slice(0, 500)}`,
+    );
   }
 
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(jsonStr) as Record<string, unknown>;
-  } catch (e) {
-    throw new Error(`Evaluator output is not valid JSON. Parse error: ${(e as Error).message}. Extracted JSON (first 500 chars): ${jsonStr.slice(0, 500)}`);
+  // Try candidates from last to first (real JSON is usually the final object)
+  let parsed: Record<string, unknown> | null = null;
+  let parseError: Error | null = null;
+
+  for (let ci = candidates.length - 1; ci >= 0; ci--) {
+    const candidate = candidates[ci];
+    let attemptParsed: Record<string, unknown> | null = null;
+
+    try {
+      attemptParsed = JSON.parse(candidate) as Record<string, unknown>;
+    } catch {
+      try {
+        // Tier 2: sanitize invalid escape sequences
+        const sanitized = candidate.replace(/\\(?!["\\/bfnrtu])/g, '\\\\');
+        attemptParsed = JSON.parse(sanitized) as Record<string, unknown>;
+      } catch {
+        try {
+          // Tier 3: jsonrepair
+          const repaired = jsonrepair(candidate);
+          attemptParsed = JSON.parse(repaired) as Record<string, unknown>;
+          if (outMeta) outMeta.repaired = true;
+          logger.warn({ round: roundNumber }, 'JSON parsed via jsonrepair (3rd-layer fallback)');
+        } catch (e3) {
+          parseError = e3 as Error;
+          continue; // try next candidate
+        }
+      }
+    }
+
+    // Validate that this candidate has the required Evaluator schema fields
+    if (
+      attemptParsed &&
+      attemptParsed['sprint_id'] &&
+      attemptParsed['verdict'] &&
+      Array.isArray(attemptParsed['criteria'])
+    ) {
+      parsed = attemptParsed;
+      break;
+    }
+
+    // Candidate parsed but missing required fields; record and try next
+    parseError = new Error(
+      `Candidate at index ${ci} parsed but missing sprint_id/verdict/criteria`,
+    );
   }
 
-  if (!parsed['sprint_id']) throw new Error('Missing sprint_id in evaluation output');
-  if (!parsed['verdict']) throw new Error('Missing verdict in evaluation output');
-  if (!Array.isArray(parsed['criteria'])) throw new Error('Missing criteria array in evaluation output');
+  if (!parsed) {
+    throw new Error(
+      `Evaluator output contains no valid JSON with sprint_id, verdict, and criteria. ` +
+      `Last error: ${parseError?.message ?? 'unknown'}. ` +
+      `Raw output (first 500 chars): ${rawOutput.slice(0, 500)}`,
+    );
+  }
 
   // Derive feature_id from criterion id (ex: "feat-001-c1" -> "feat-001") when model omits it.
   const deriveFeatureId = (id: string): string => {

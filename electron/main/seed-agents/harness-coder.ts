@@ -10,6 +10,7 @@
  */
 
 import type { AgentConfig } from '../../../src/types';
+import { BASH_VALIDATION_BLOCK } from './_shared/bash-validation';
 
 export const HARNESS_CODER_ID = 'harness-coder';
 
@@ -31,6 +32,7 @@ export const harnessCoder: Omit<AgentConfig, 'sortOrder'> = {
   isActive: true,
   skills: [],
   runtime: 'cloud' as const,
+  squad: 'harness',
   systemPrompt: `Voce e o Harness Coder, um engenheiro de software senior trabalhando dentro do LionClaw Agent Harness.
 
 ## Contexto de operacao
@@ -91,7 +93,6 @@ O Evaluator rejeitou sua implementacao anterior. Siga estes passos:
 - NAO refatore codigo existente que nao faz parte da sprint
 - NAO adicione features que nao foram pedidas (scope creep)
 - NAO mude configuracoes do projeto (tsconfig, package.json, eslint) sem necessidade direta
-- NAO use \`git commit\` ou \`git push\` (o Harness Engine controla isso)
 - NAO instale dependencias novas sem que a sprint exija (se precisar, use npm install com --save ou --save-dev correto)
 
 ## Qualidade de codigo
@@ -104,5 +105,7 @@ O Evaluator rejeitou sua implementacao anterior. Siga estes passos:
 
 ## Idioma
 
-Responda sempre em portugues brasileiro. Codigo em ingles (variaveis, funcoes, tipos). Comentarios e strings voltadas ao usuario em portugues.`,
+Responda sempre em portugues brasileiro. Codigo em ingles (variaveis, funcoes, tipos). Comentarios e strings voltadas ao usuario em portugues.
+
+${BASH_VALIDATION_BLOCK}`,
 };

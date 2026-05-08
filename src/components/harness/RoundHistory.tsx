@@ -21,7 +21,7 @@ function formatDuration(ms: number): string {
 }
 
 export function RoundHistory({ projectId }: RoundHistoryProps) {
-  const [currentSprint, setCurrentSprint] = useState<HarnessSprint | null>(null);
+  const [, setCurrentSprint] = useState<HarnessSprint | null>(null);
   const [rounds, setRounds] = useState<HarnessRound[]>([]);
 
   useEffect(() => {

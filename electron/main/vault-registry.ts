@@ -137,3 +137,25 @@ export function registerVaultEntry(entry: Omit<VaultEntry, 'configured'>): void 
 }
 
 export { getSecret } from './secrets-vault';
+
+export function registerExternalProviderVaultEntries(): void {
+  registerVaultEntry({
+    key: 'HARNESS_OPENROUTER_KEY',
+    label: 'OpenRouter API Key',
+    description: 'Chave da API OpenRouter para usar modelos externos no Harness.',
+    service: 'openrouter',
+    required: false,
+    placeholder: 'sk-or-v1-...',
+    docsUrl: 'https://openrouter.ai/settings/keys',
+  });
+
+  registerVaultEntry({
+    key: 'HARNESS_OPENAI_KEY',
+    label: 'OpenAI API Key (Harness)',
+    description: 'Chave da OpenAI dedicada ao Harness. Separada da key de embeddings.',
+    service: 'openai-harness',
+    required: false,
+    placeholder: 'sk-...',
+    docsUrl: 'https://platform.openai.com/api-keys',
+  });
+}

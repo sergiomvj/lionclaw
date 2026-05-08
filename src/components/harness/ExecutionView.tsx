@@ -137,11 +137,14 @@ export function ExecutionView({ projectId }: ExecutionViewProps) {
     return unsub;
   }, [projectId, appendStream]);
 
-  async function handleAction(fn: () => Promise<void>, label: string) {
+  async function handleAction(fn: () => Promise<void | { error: string }>, label: string) {
     setActionPending(label);
     setActionError(null);
     try {
-      await fn();
+      const result = await fn();
+      if (result && typeof result === 'object' && 'error' in result) {
+        setActionError(result.error);
+      }
     } catch (err) {
       setActionError(err instanceof Error ? err.message : `Erro ao executar: ${label}`);
     } finally {

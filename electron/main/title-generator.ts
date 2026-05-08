@@ -1,9 +1,56 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { getApiKey } from './secrets-vault';
-import { updateSessionTitle, getSessionMessages } from './db';
+import { updateSessionTitle, getSessionMessages, getSession } from './db';
 import { createLogger } from './logger';
 
 const logger = createLogger('title-generator');
+const FALLBACK_WORD_LIMIT = 6;
+const FALLBACK_TITLE_LIMIT = 50;
+
+function buildFallbackTitle(message: string): string {
+  const cleaned = message
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`[^`]*`/g, ' ')
+    .replace(/https?:\/\/\S+/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const words = cleaned
+    .split(/\s+/)
+    .map((word) => word.replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, ''))
+    .filter((word) => word.length > 0)
+    .slice(0, FALLBACK_WORD_LIMIT);
+
+  const title = words.join(' ').substring(0, FALLBACK_TITLE_LIMIT).trim();
+  return title.length >= 3 ? title : 'Conversa';
+}
+
+async function notifySessionsUpdated(): Promise<void> {
+  const { BrowserWindow } = await import('electron');
+  const win = BrowserWindow.getAllWindows()[0];
+  if (win && !win.isDestroyed()) {
+    win.webContents.send('chat:sessions-updated');
+  }
+}
+
+export function ensureInitialSessionTitle(sessionId: string, message: string): void {
+  try {
+    const session = getSession(sessionId);
+    if (!session || session.title || session.type === 'scheduled' || session.type === 'telegram') {
+      return;
+    }
+
+    const title = buildFallbackTitle(message);
+    updateSessionTitle(sessionId, title);
+    logger.info({ sessionId, title }, 'Fallback session title set');
+
+    notifySessionsUpdated().catch((error) => {
+      logger.warn({ error, sessionId }, 'Failed to notify fallback session title');
+    });
+  } catch (error) {
+    logger.warn({ error, sessionId }, 'Failed to set fallback session title');
+  }
+}
 
 /**
  * Gera um titulo curto e descritivo para uma sessao de chat
@@ -67,11 +114,7 @@ Titulo:`,
     logger.info({ sessionId, title: titleText }, 'Session title generated');
 
     // Notifica renderer para recarregar lista de sessoes
-    const { BrowserWindow } = await import('electron');
-    const win = BrowserWindow.getAllWindows()[0];
-    if (win && !win.isDestroyed()) {
-      win.webContents.send('chat:sessions-updated');
-    }
+    await notifySessionsUpdated();
   } catch (error) {
     // Falha silenciosa - titulo eh cosmetic, nao deve quebrar o chat
     logger.error({ error, sessionId }, 'Failed to generate session title');

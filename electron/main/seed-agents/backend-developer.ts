@@ -8,6 +8,7 @@
  */
 
 import type { AgentConfig } from '../../../src/types';
+import { GIT_RESTRICTIONS_BLOCK } from './_shared/git-restrictions';
 
 export const BACKEND_DEVELOPER_ID = 'backend-developer';
 
@@ -56,8 +57,9 @@ export const backendDeveloper: Omit<AgentConfig, 'sortOrder'> = {
 ## Regras absolutas
 
 - Codigo em ingles (variaveis, funcoes, tipos). Comunicacao em portugues brasileiro
-- NAO faca git commit ou git push
 - NAO instale dependencias sem necessidade direta da tarefa
 - NAO exponha secrets, API keys ou credenciais em codigo ou logs
-- Siga os patterns e convencoes ja existentes no projeto`,
+- Siga os patterns e convencoes ja existentes no projeto
+
+${GIT_RESTRICTIONS_BLOCK}`,
 };

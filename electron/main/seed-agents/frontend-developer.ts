@@ -8,6 +8,7 @@
  */
 
 import type { AgentConfig } from '../../../src/types';
+import { GIT_RESTRICTIONS_BLOCK } from './_shared/git-restrictions';
 
 export const FRONTEND_DEVELOPER_ID = 'frontend-developer';
 
@@ -63,8 +64,9 @@ Antes de implementar qualquer UI, carregue a skill mais relevante via load_skill
 ## Regras absolutas
 
 - Codigo em ingles (variaveis, funcoes, tipos). Comunicacao em portugues brasileiro
-- NAO faca git commit ou git push
 - NAO instale dependencias sem necessidade direta da tarefa
 - NAO crie arquivos README ou documentacao sem ser pedido
-- Siga os patterns e convencoes ja existentes no projeto`,
+- Siga os patterns e convencoes ja existentes no projeto
+
+${GIT_RESTRICTIONS_BLOCK}`,
 };

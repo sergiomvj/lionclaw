@@ -3,6 +3,82 @@ import { Bot, Plus, Pencil, Trash2, Power, PowerOff } from 'lucide-react';
 import type { AgentConfig } from '@/types';
 import { AgentFormModal } from '@/components/agents/AgentFormModal';
 import { DeleteAgentDialog } from '@/components/agents/DeleteAgentDialog';
+import { PROVIDER_PRESETS } from '@/lib/provider-presets';
+import { resolveContextWindow, formatContextWindow } from '@/lib/agent-helpers';
+
+const BADGE_BG = '#F97316';
+const BADGE_FG = '#FFFFFF';
+const BADGE_CLASS = 'px-1.5 py-0.5 rounded text-[10px] font-medium cursor-default';
+
+function RuntimeBadge({ agent }: { agent: AgentConfig }) {
+  if (agent.runtime === 'cloud') {
+    return (
+      <span
+        title={`Modelo: ${agent.model}`}
+        style={{ backgroundColor: BADGE_BG, color: BADGE_FG }}
+        className={BADGE_CLASS}
+      >
+        Anthropic
+      </span>
+    );
+  }
+
+  if (agent.runtime === 'local') {
+    const provider = agent.localConfig?.provider ?? 'local';
+    const model = agent.localConfig?.model ?? '';
+    return (
+      <div className="flex items-center gap-1">
+        <span
+          title={`${provider} / ${model}`}
+          style={{ backgroundColor: BADGE_BG, color: BADGE_FG }}
+          className={BADGE_CLASS}
+        >
+          Local
+        </span>
+        <span className="px-1.5 py-0.5 bg-zinc-800 rounded text-[10px] text-zinc-400">
+          {agent.localMode === 'smart' ? 'SMART' : 'SIMPLE'}
+        </span>
+      </div>
+    );
+  }
+
+  if (agent.runtime === 'external' && agent.externalConfig) {
+    const { provider, model } = agent.externalConfig;
+    const label = PROVIDER_PRESETS[provider]?.label ?? provider;
+    const cw = resolveContextWindow(agent);
+    const cwText = cw !== null ? ` (${formatContextWindow(cw)})` : '';
+    const tooltipText = `${model}${cwText}`;
+    return (
+      <span
+        title={tooltipText}
+        style={{ backgroundColor: BADGE_BG, color: BADGE_FG }}
+        className={BADGE_CLASS}
+      >
+        {label}
+      </span>
+    );
+  }
+
+  if (agent.runtime === 'codex' && agent.codexConfig) {
+    const { model } = agent.codexConfig;
+    return (
+      <div className="flex items-center gap-1">
+        <span
+          title={`Codex / ${model}`}
+          className={`${BADGE_CLASS} bg-purple-600/20 text-purple-400 border border-purple-600/30`}
+          style={undefined}
+        >
+          Codex
+        </span>
+        <span className="px-1.5 py-0.5 bg-zinc-800 rounded text-[10px] text-zinc-400">
+          {model}
+        </span>
+      </div>
+    );
+  }
+
+  return null;
+}
 
 export function SubAgentsPage() {
   const [agents, setAgents] = useState<AgentConfig[]>([]);
@@ -122,20 +198,13 @@ export function SubAgentsPage() {
                   <div>
                     <div className="flex items-center gap-2">
                       <h3 className="text-sm font-semibold text-zinc-200">{agent.name}</h3>
-                      {agent.runtime === 'local' && (
-                        <div className="flex items-center gap-1">
-                          <span className="px-1.5 py-0.5 bg-green-500/10 border border-green-500/30 rounded text-[10px] text-green-400 font-medium">
-                            LOCAL
-                          </span>
-                          <span className="px-1.5 py-0.5 bg-zinc-800 rounded text-[10px] text-zinc-400">
-                            {agent.localMode === 'smart' ? 'SMART' : 'SIMPLE'}
-                          </span>
-                        </div>
-                      )}
+                      <RuntimeBadge agent={agent} />
                     </div>
                     <p className="text-xs text-zinc-500">
                       {agent.runtime === 'local' ? (
                         <span className="text-green-400">{agent.localConfig?.provider} - {agent.localConfig?.model}</span>
+                      ) : agent.runtime === 'external' ? (
+                        <span style={{ color: '#C2410C' }}>{agent.externalConfig?.model}</span>
                       ) : (
                         agent.model
                       )}

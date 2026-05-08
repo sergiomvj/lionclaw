@@ -1,6 +1,21 @@
 // ---- Pipeline types (re-exported from pipeline.ts) ----
 export * from './pipeline';
 
+// Imports tipados pra usar dentro deste arquivo (ex: window.lionclaw.pipeline API).
+// `export *` apenas re-expoe; nao introduz binding local.
+import type {
+  PipelineProject,
+  PipelineMessage,
+  PipelineMetricsResult,
+  PipelineStreamChunk,
+  PipelinePhaseChangedEvent,
+  PipelineProjectUpdatedEvent,
+  PipelineNotesUpdatedEvent,
+  PipelineSprintCompleteEvent,
+  PipelineSprintMessage,
+  SecurityAgentStatus,
+} from './pipeline';
+
 // ---- Chat ----
 
 export interface ChatAttachment {
@@ -125,6 +140,34 @@ export interface AskQuestionResponse {
 
 // ---- SubAgents ----
 
+export type LocalLLMProvider = 'ollama' | 'lmstudio' | 'openai-compatible';
+export type ExternalProvider = 'openrouter' | 'openai' | 'openai-compatible';
+export type LLMProvider = LocalLLMProvider | ExternalProvider;
+
+export interface ExternalConfig {
+  provider: ExternalProvider;
+  baseUrl: string;
+  model: string;
+  /** Vault key name (e.g. "HARNESS_OPENROUTER_KEY"). Never the key itself. */
+  apiKeyRef: string;
+  temperature?: number;
+  maxTokens?: number;
+  /** Custom headers (e.g. HTTP-Referer for OpenRouter). */
+  extraHeaders?: Record<string, string>;
+  /**
+   * Context window in tokens.
+   * Manual input only for provider 'openai-compatible' (Custom).
+   * For OpenRouter/OpenAI, derived from MODEL_CATALOG at runtime and not persisted.
+   */
+  contextWindow?: number;
+}
+
+export interface CodexConfig {
+  model: string;
+  sandbox?: 'workspace-write' | 'read-only' | 'danger-full-access';
+  reasoningEffort?: 'low' | 'medium' | 'high';
+}
+
 export interface AgentConfig {
   id: string;
   name: string;
@@ -140,14 +183,16 @@ export interface AgentConfig {
   thinkingBudget?: number;
   maxTurns?: number;
   skills: string[];
-  runtime: 'cloud' | 'local';
+  runtime: 'cloud' | 'local' | 'external' | 'codex';
   localConfig?: {
-    provider: 'ollama' | 'lmstudio' | 'openai-compatible';
+    provider: LocalLLMProvider;
     baseUrl: string;
     model: string;
     temperature?: number;
     maxTokens?: number;
   };
+  externalConfig?: ExternalConfig;
+  codexConfig?: CodexConfig;
   localMode?: 'simple' | 'smart';
   maxToolRounds?: number;
   squad?: string;
@@ -371,72 +416,13 @@ export interface AuditEntry {
   id: number;
   sessionId?: string;
   subagent?: string;
-  eventType: 'tool_call' | 'tool_result' | 'error' | 'confirm_request' | 'confirm_response';
+  eventType: 'tool_call' | 'tool_result' | 'tool_blocked' | 'error' | 'confirm_request' | 'confirm_response';
   toolName?: string;
   input?: string;
   output?: string;
   durationMs?: number;
   approved?: boolean;
   createdAt: string;
-}
-
-// ---- Usage ----
-
-export interface UsageStats {
-  totalInputTokens: number;
-  totalOutputTokens: number;
-  totalCostUsd: number;
-  totalRequests: number;
-  byModel: Array<{
-    model: string;
-    inputTokens: number;
-    outputTokens: number;
-    costUsd: number;
-    requests: number;
-  }>;
-  byDay: Array<{
-    date: string;
-    inputTokens: number;
-    outputTokens: number;
-    costUsd: number;
-    requests: number;
-  }>;
-}
-
-export type UsageFilter = {
-  from?: string;
-  to?: string;
-  model?: string;
-};
-
-export interface AgentUsageRow {
-  agentId: string | null;
-  agentName: string;
-  model: string;
-  executions: number;
-  totalRequests: number;
-  inputTokens: number;
-  outputTokens: number;
-  cacheReadTokens: number;
-  cacheCreationTokens: number;
-  costUsd: number;
-  toolUses: number;
-  totalDurationMs: number;
-}
-
-export interface AgentUsageStats {
-  totalCostUsd: number;
-  totalInputTokens: number;
-  totalOutputTokens: number;
-  totalRequests: number;
-  byAgent: AgentUsageRow[];
-  byDay: Array<{
-    date: string;
-    inputTokens: number;
-    outputTokens: number;
-    costUsd: number;
-    requests: number;
-  }>;
 }
 
 // ---- Settings ----
@@ -505,6 +491,9 @@ export const TOOL_CATEGORY_LABELS: Record<ToolCategory, string> = {
 // ---- IPC API ----
 
 export interface LionClawAPI {
+  app: {
+    getVersion: () => Promise<{ version: string; label: string }>;
+  };
   chat: {
     send: (message: string, options?: { sessionId?: string; agentId?: string; attachments?: ChatAttachment[] }) => Promise<void>;
     stop: () => Promise<void>;
@@ -608,11 +597,13 @@ export interface LionClawAPI {
     verifyTOTP: (code: string) => Promise<boolean>;
     onLocked: (cb: () => void) => () => void;
   };
-  usage: {
-    getStats: (filter?: UsageFilter) => Promise<UsageStats>;
-    getSessionStats: (sessionId: string) => Promise<{ inputTokens: number; outputTokens: number; costUsd: number }>;
-    getAgentStats: (filter?: UsageFilter) => Promise<AgentUsageStats>;
-    getTaskExecutions: (filter?: { sessionId?: string; agentId?: string; from?: string; to?: string }) => Promise<Array<Record<string, unknown>>>;
+  codeburn: {
+    spawn: (cols: number, rows: number) => Promise<{ ok: true } | { ok: false; error: string }>;
+    write: (data: string) => Promise<void>;
+    resize: (cols: number, rows: number) => Promise<void>;
+    kill: () => Promise<void>;
+    onData: (cb: (chunk: string) => void) => () => void;
+    onExit: (cb: (info: { exitCode: number; signal: number | null }) => void) => () => void;
   };
   soul: {
     get: () => Promise<string>;
@@ -647,6 +638,24 @@ export interface LionClawAPI {
     set: (key: string, value: string) => Promise<void>;
     delete: (key: string) => Promise<void>;
     check: (key: string) => Promise<boolean>;
+    /** Registers a new vault entry (if not already registered) and stores the value. */
+    registerAndSet: (entry: {
+      key: string;
+      label: string;
+      description: string;
+      service: string;
+      required: boolean;
+      placeholder?: string;
+      docsUrl?: string;
+    }, value: string) => Promise<{ ok: true } | { error: string }>;
+  };
+  provider: {
+    /** Tests connectivity using the stored vault key for the given provider. */
+    testConnection: (
+      providerName: string,
+      baseUrl: string,
+      apiKeyRef: string,
+    ) => Promise<{ ok: true } | { ok: false; error: string }>;
   };
   image: {
     generate: (prompt: string, options?: { aspectRatio?: string }) =>
@@ -701,16 +710,18 @@ export interface LionClawAPI {
       name: string;
       description?: string;
       projectPath: string;
-      specText: string;
+      // Aceita conteudo direto OU caminho pra um arquivo SPEC existente.
+      specText?: string;
+      specFilePath?: string;
       config: HarnessConfig;
-    }) => Promise<{ projectId: string }>;
-    plan: (projectId: string) => Promise<void>;
-    approveSprints: (projectId: string) => Promise<void>;
-    regenerateSprints: (projectId: string, feedback: string) => Promise<void>;
-    run: (projectId: string) => Promise<void>;
-    pause: (projectId: string) => Promise<void>;
-    resume: (projectId: string) => Promise<void>;
-    abort: (projectId: string) => Promise<void>;
+    }) => Promise<{ projectId: string } | { error: string }>;
+    plan: (projectId: string) => Promise<void | { error: string }>;
+    approveSprints: (projectId: string) => Promise<void | { error: string }>;
+    regenerateSprints: (projectId: string, feedback: string) => Promise<void | { error: string }>;
+    run: (projectId: string) => Promise<void | { error: string }>;
+    pause: (projectId: string) => Promise<void | { error: string }>;
+    resume: (projectId: string) => Promise<void | { error: string }>;
+    abort: (projectId: string) => Promise<void | { error: string }>;
     deleteProject: (projectId: string) => Promise<void>;
     getProject: (projectId: string) => Promise<HarnessProject | null>;
     listProjects: () => Promise<HarnessProject[]>;
@@ -739,30 +750,6 @@ export interface LionClawAPI {
     onMetricsUpdate: (cb: (data: Record<string, unknown>) => void) => () => void;
     onPlanningDone: (cb: (data: Record<string, unknown>) => void) => () => void;
     onError: (cb: (data: Record<string, unknown>) => void) => () => void;
-  };
-  workflow: {
-    start: () => Promise<{ workflowRunId: string; notesPath: string }>;
-    approve: (workflowRunId: string) => Promise<void>;
-    cancel: (workflowRunId: string) => Promise<void>;
-    setUIActive: (active: boolean) => Promise<void>;
-    getActive: () => Promise<{
-      workflowRunId: string;
-      currentStage: number;
-      currentQuestion: string;
-      notesPath: string | null;
-      status: string;
-      notesContent: string;
-      messages: Array<{ id: number; role: 'user' | 'assistant'; content: string; agent?: string }>;
-    } | null>;
-    onActivated: (cb: (data: { workflowRunId: string; notesPath: string }) => void) => () => void;
-    onStageChanged: (cb: (data: { stage: number }) => void) => () => void;
-    onStream: (cb: (data: { type: string; content?: string; tool?: string; error?: string }) => void) => () => void;
-    onNotesUpdated: (cb: (data: { content: string; path: string }) => void) => () => void;
-    onAgentStream: (cb: (data: { agent: string; msg: { type: string; content?: string; tool?: string } }) => void) => () => void;
-    onGenerationRound: (cb: (data: { round: number; max: number }) => void) => () => void;
-    onGenerationDone: (cb: (data: { specPath: string; notesPath: string; passed: boolean }) => void) => () => void;
-    onQuestionChanged: (cb: (data: { question: string; total: number; current: number }) => void) => () => void;
-    onDiscoveryComplete: (cb: (data: { notesPath: string; notesContent: string }) => void) => () => void;
   };
   mgraph: {
     graph: () => Promise<GraphData>;
@@ -818,12 +805,15 @@ export interface LionClawAPI {
     pause: (projectId: string) => Promise<{ ok: true } | { error: string }>;
     resume: (projectId: string) => Promise<{ ok: true } | { error: string }>;
     send: (projectId: string, message: string, attachments?: ChatAttachment[]) => Promise<{ ok: true } | { error: string }>;
+    getConversationPhases: () => Promise<PipelineConversationPhases>;
     approve: (projectId: string, metadata?: Record<string, unknown>) => Promise<{ ok: true } | { error: string }>;
     decided: (projectId: string, blockId: string) => Promise<{ ok: true } | { error: string }>;
     conclude: (projectId: string) => Promise<{ ok: true } | { error: string }>;
     retry: (projectId: string) => Promise<{ ok: true } | { error: string }>;
     confirmDevelopment: (projectId: string) => Promise<{ ok: true } | { error: string }>;
-    createProject: (data: { name: string; description: string; projectPath: string; startPhase: number; specPath?: string; prdPath?: string }) => Promise<{ id: string } | { error: string }>;
+    createProject: (data: { name: string; description: string; projectPath: string; startPhase: number; specPath?: string; prdPath?: string; pipelineType?: string }) => Promise<{ id: string } | { error: string }>;
+    getSecurityAgentStatus: (projectId: string) => Promise<SecurityAgentStatus[]>;
+    getAuditAgentsState: (projectId: string) => Promise<{ agents: Array<{ agentId: string; agentName: string; status: string; findingsCount?: number; costUsd: number; durationMs: number; model: string | null; startedAt?: string | null; completedAt?: string | null; toolCallsCount: number }> } | { error: string }>;
     deleteProject: (projectId: string) => Promise<{ ok: true } | { error: string }>;
     listProjects: () => Promise<PipelineProject[]>;
     getProject: (projectId: string) => Promise<PipelineProject | { error: string }>;
@@ -832,6 +822,9 @@ export interface LionClawAPI {
     getMetrics: (projectId: string) => Promise<PipelineMetricsResult | { error: string }>;
     getReport: (projectId: string) => Promise<{ report: string } | { error: string }>;
     exportReport: (projectId: string, format: 'md') => Promise<{ ok: true; reportPath: string } | { error: string }>;
+    openProjectFile: (projectId: string, relativePath: string) => Promise<{ ok: true } | { error: string }>;
+    openSmokeTest: (projectId: string) => Promise<{ ok: true } | { error: string }>;
+    getSmokeTestPath: (projectId: string) => Promise<{ exists: boolean; path?: string }>;
     onStream: (cb: (chunk: PipelineStreamChunk) => void) => () => void;
     onPhaseChanged: (cb: (event: PipelinePhaseChangedEvent) => void) => () => void;
     onProjectUpdated: (cb: (event: PipelineProjectUpdatedEvent) => void) => () => void;
@@ -845,16 +838,140 @@ export interface LionClawAPI {
     resetPhase: (projectId: string, phase: number) => Promise<{ ok: boolean; error?: string }>;
     resetSprint: (projectId: string, sprintIndex: number) => Promise<{ ok: boolean; error?: string }>;
     getResetPreview: (projectId: string, target: { phase?: number; sprintIndex?: number }) => Promise<{ filesToDelete: string[]; messagesToDelete: number; metricsToDelete: number; sprintsAffected: number[] }>;
-    readPhaseArtifact: (projectId: string, phase: number) => Promise<{ type: 'markdown'; content: string } | { type: 'sprints'; sprints: HarnessSprint[] }>;
+    readPhaseArtifact: (projectId: string, phase: number) => Promise<PipelinePhaseArtifact>;
     getSprintHistory: (projectId: string, sprintIndex: number) => Promise<PipelineSprintMessage[]>;
     listSprints: (projectId: string) => Promise<HarnessSprint[]>;
     getSprintDetail: (projectId: string, sprintIndex: number) => Promise<{ sprint: HarnessSprint } | { error: string }>;
     onResetComplete: (cb: (data: { projectId: string; phase?: number; sprintIndex?: number }) => void) => () => void;
+    onSecurityAgentStatus: (cb: (data: { projectId: string; agentId: string; agentName: string; status: 'pending' | 'running' | 'completed' | 'failed'; findingsCount?: number; error?: string }) => void) => () => void;
+    onAuditAgentProgress: (cb: (event: import('./pipeline').PipelineAuditAgentProgressEvent) => void) => () => void;
+    onResolutionTrackerComplete: (cb: (data: { projectId: string }) => void) => () => void;
+    readManifest: (projectId: string) => Promise<import('./pipeline').RepoManifest | null>;
+    onManifest: (cb: (data: { projectId: string; manifest: import('./pipeline').RepoManifest }) => void) => () => void;
+    onStalled: (cb: (data: { projectId: string; phase: number; agentId: string; lastChunkAt: number; secondsSinceLastChunk: number }) => void) => () => void;
+    onAuthRequired: (cb: (data: { projectId: string; phaseNumber: number; agentId: string; message: string }) => void) => () => void;
+    resumeAfterAuth: (projectId: string) => Promise<{ ok: true } | { ok: false; message: string }>;
   };
   dialog: {
     openFile: (filters?: Array<{ name: string; extensions: string[] }>) => Promise<string | null>;
     openDirectory: () => Promise<string | null>;
   };
+  codex: {
+    status: () => Promise<{ installed: boolean; version: string | null; authenticated: boolean }>;
+    test: () => Promise<{ ok: boolean; message: string }>;
+    openLogin: () => Promise<{ ok: boolean }>;
+    setBinaryPath: (path: string) => Promise<{ ok: boolean }>;
+    // SPEC-codex-windows-fix.md Camada 2 + 3 + 4
+    checkPrepNeeded: (projectPath: string) => Promise<CodexPrepCheckResult>;
+    applyPrep: (repoRoot: string) => Promise<CodexPrepApplyResult>;
+    grantSkipConsent: (repoRoot: string) => Promise<{ ok: boolean; error?: string }>;
+    onWindowsHealthWarning: (handler: (payload: CodexWindowsHealthWarning) => void) => () => void;
+    onPatchFailureWarning: (handler: (payload: CodexPatchFailureWarning) => void) => () => void;
+    onWindowsPrepSkipped: (handler: (payload: CodexWindowsPrepSkipped) => void) => () => void;
+  };
+}
+
+// ---- pipeline IPC return types — sincronizar com handlers em ipc-handlers.ts ----
+
+/**
+ * Retorno de `pipeline:get-conversation-phases`. Cada chave mapeia para um
+ * `pipelineType` do engine (campo `pipelineType` em `PipelineProject`):
+ * - `security`     → SECURITY_CONVERSATION_PHASES (engine)
+ * - `dev`          → DEV_CONVERSATION_PHASES (engine, tambem aplicado a feature)
+ * - `architecture` → ARCHITECTURE_CONVERSATION_PHASES (engine, pipeline-type 'architecture-review')
+ *
+ * Note: `feature` nao tem entrada propria — o engine usa DEV_CONVERSATION_PHASES
+ * pra ambos. Fica explicito aqui pra evitar surpresa em call sites futuros.
+ */
+export interface PipelineConversationPhases {
+  security: number[];
+  dev: number[];
+  architecture: number[];
+}
+
+/**
+ * Retorno de `pipeline:read-phase-artifact`. Tipo discriminado por `type`:
+ * - `markdown`     → conteudo de arquivo MD generico (PRD, SPEC, stories, etc).
+ * - `sprints`      → lista de sprints persistidos no DB (planner output).
+ * - `architecture` → fase 1-7 do architecture-review pipeline; renderer escolhe
+ *                    entre rich view (1-4) e markdown view (5-7) baseado em `phase`.
+ *                    `markdown` e `json` sao independentemente opcionais.
+ * - `{ error }`    → projectId nao encontrado (handler retorna `{ error: 'Project not found' }`).
+ */
+export type PipelinePhaseArtifact =
+  | { type: 'markdown'; content: string }
+  | { type: 'sprints'; sprints: HarnessSprint[] }
+  | { type: 'architecture'; phase: number; markdown: string | null; json: string | null }
+  | { error: string };
+
+// ---- SPEC-codex-windows-fix.md tipos compartilhados (renderer + main) ----
+
+export type CodexWindowsIssueType =
+  | 'autocrlf-true'
+  | 'no-gitattributes'
+  | 'mixed-line-endings'
+  | 'powershell-5.1';
+
+export interface CodexWindowsIssue {
+  type: CodexWindowsIssueType;
+  severity: 'low' | 'medium' | 'high';
+  message: string;
+  hint: string;
+}
+
+export interface CodexPrepCheckResult {
+  needs: boolean;
+  reason:
+    | 'not-windows'
+    | 'not-git-repo'
+    | 'codex-not-authenticated'
+    | 'no-codex-agents'
+    | 'no-issues'
+    | 'consent-current'
+    | 'consent-skip-current'
+    | 'needs-dialog';
+  repoRoot?: string;
+  issues?: CodexWindowsIssue[];
+  consent?: {
+    repoRoot: string;
+    prepVersion: number;
+    action: 'prepared' | 'skip';
+    consentedAt: number;
+    lastAppliedAt: number | null;
+  } | null;
+}
+
+export type CodexPrepApplyResult =
+  | { applied: true; filesAffected: number }
+  | {
+      applied: false;
+      reason: 'not-windows' | 'no-git-repo' | 'has-submodules' | 'dirty-tree' | 'error';
+      message?: string;
+    };
+
+export interface CodexWindowsHealthWarning {
+  projectId?: string;
+  agentId: string;
+  cwd: string;
+  repoRoot: string;
+  timestamp: number;
+  issues: CodexWindowsIssue[];
+}
+
+export interface CodexPatchFailureWarning {
+  projectId?: string;
+  agentId: string;
+  cwd: string;
+  count: number;
+  samples: Array<{ source: string; text: string; ts: number }>;
+  timestamp: number;
+}
+
+export interface CodexWindowsPrepSkipped {
+  projectId?: string;
+  repoRoot: string;
+  reason: string;
+  timestamp: number;
 }
 
 declare global {
@@ -1115,21 +1232,6 @@ export interface GraphData {
   edges: GraphEdge[];
 }
 
-// ---- Workflow (BuildPlan) ----
-
-export interface WorkflowRun {
-  id: string;
-  workflowId: string;
-  sessionId: string;
-  currentStage: number;
-  currentQuestion?: string;
-  notesPath: string | null;
-  status: 'active' | 'completed' | 'cancelled';
-  startedAt: string;
-  updatedAt: string;
-  completedAt: string | null;
-}
-
 // ---- Harness ----
 
 export interface HarnessProject {
@@ -1139,7 +1241,7 @@ export interface HarnessProject {
   projectPath: string;
   specPath: string;
   sprintsJsonPath?: string;
-  status: 'planning' | 'reviewing' | 'ready' | 'running' | 'paused' | 'done' | 'failed';
+  status: 'idle' | 'planning' | 'reviewing' | 'ready' | 'running' | 'paused' | 'done' | 'failed' | 'aborted' | 'interrupted';
   config: HarnessConfig;
   currentSprintIndex: number;
   totalSprints: number;
@@ -1151,6 +1253,20 @@ export interface HarnessProject {
   plannerDurationMs: number;
   createdAt: string;
   updatedAt: string;
+  pipelineType?: import('./pipeline').PipelineType;
+  pipelineDocsId?: string | null;
+  // Pipeline progress fields (V37+, lidos pelo mapHarnessProject em db.ts).
+  // Existem como colunas reais em harness_projects e sao consumidos pelo
+  // pipeline-engine/handlers — declarados aqui pra eliminar drift type/DB.
+  pipelineCurrentPhase?: number | null;
+  pipelineStartPhase?: number | null;
+  pipelineSprintIndex?: number;
+  pipelineDiscoveryBlock?: number;
+  // Caminhos opcionais persistidos no DB.
+  prdPath?: string;
+  discoveryNotesPath?: string;
+  // Security pipeline summary (JSON serialized) — populado pos-fase 3.
+  securitySummaryJson?: string | null;
 }
 
 export interface HarnessConfig {
@@ -1160,6 +1276,15 @@ export interface HarnessConfig {
   plannerAgentId: string;
   stack: string[];
   plannerOutputFormat?: 'json' | 'markdown';
+  /**
+   * Per-pipelineType extension config.
+   * Architecture review uses this to persist runId + selectedCandidateId
+   * without needing a dedicated DB column (R10-friendly).
+   */
+  architectureReview?: {
+    runId?: string;
+    selectedCandidateId?: string | null;
+  };
 }
 
 export interface HarnessSprint {
@@ -1202,6 +1327,8 @@ export interface SprintJsonDetail {
   estimated_rounds: number;
 }
 
+export type CostSource = 'sdk_anthropic' | 'reported' | 'calculated' | 'fallback_zero';
+
 export interface HarnessRound {
   id: string;
   sprintId: string;
@@ -1226,6 +1353,20 @@ export interface HarnessRound {
   feedbackSummary?: string;
   startedAt: string;
   completedAt?: string;
+  /** How the cost was determined for this round. Null for rounds created before V44. */
+  costSource?: CostSource | null;
+  /** Runtime used to execute this round. Null for rounds created before V44. */
+  runtimeUsed?: 'cloud' | 'local' | 'external' | 'codex' | null;
+  /** Provider slug used to execute this round. Null for rounds created before V44. */
+  providerUsed?: string | null;
+  /** Exact model slug executed in this round. Null for rounds created before V44. */
+  modelUsed?: string | null;
+  /** Free-form telemetry bag. Added in V46. */
+  metadata?: Record<string, unknown>;
+  /** SPEC-codex-windows-fix.md Camada 4: contagem de apply_patch verification
+   *  failures observados durante este round. Sempre 0 pra runtimes nao-Codex.
+   *  Adicionado em V51. */
+  codexPatchFailures?: number;
 }
 
 export interface HarnessProjectMetrics {

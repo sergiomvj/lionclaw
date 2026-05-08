@@ -1,0 +1,482 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`IPC channel payload snapshots > chat:stream > ask_question chunk (from ask-question.ts) 1`] = `
+{
+  "askRequest": {
+    "id": "ask_xyz789",
+    "questions": [
+      {
+        "header": "Selecione",
+        "options": [
+          {
+            "description": "Desenvolvimento",
+            "label": "dev",
+          },
+          {
+            "description": "Producao",
+            "label": "prod",
+          },
+        ],
+        "question": "Qual ambiente?",
+      },
+    ],
+  },
+  "type": "ask_question",
+}
+`;
+
+exports[`IPC channel payload snapshots > chat:stream > done chunk with queueRemaining 1`] = `
+{
+  "queueRemaining": 2,
+  "sessionId": "sess_abc123",
+  "type": "done",
+}
+`;
+
+exports[`IPC channel payload snapshots > chat:stream > error chunk 1`] = `
+{
+  "error": "API key nao configurada. Va em Settings.",
+  "type": "error",
+}
+`;
+
+exports[`IPC channel payload snapshots > chat:stream > session chunk (sessionId broadcast) 1`] = `
+{
+  "content": "sess_abc123",
+  "type": "session",
+}
+`;
+
+exports[`IPC channel payload snapshots > chat:stream > text chunk with sessionId 1`] = `
+{
+  "content": "Olá, como posso ajudar?",
+  "sessionId": "sess_abc123",
+  "type": "text",
+}
+`;
+
+exports[`IPC channel payload snapshots > chat:stream > tool_call chunk 1`] = `
+{
+  "input": {
+    "file_path": "/Users/example/file.ts",
+  },
+  "sessionId": "sess_abc123",
+  "tool": "Read",
+  "type": "tool_call",
+}
+`;
+
+exports[`IPC channel payload snapshots > enrich:metrics > enricher metrics 1`] = `
+{
+  "metrics": {
+    "apiRequests": 1,
+    "cacheCreationTokens": 0,
+    "cacheReadTokens": 2000,
+    "costUsd": 0.0123,
+    "durationMs": 4100,
+    "inputTokens": 5000,
+    "messages": 1,
+    "outputTokens": 1200,
+    "toolUses": 2,
+  },
+  "phase": "enricher",
+  "sessionId": "enrich_sess_42",
+}
+`;
+
+exports[`IPC channel payload snapshots > enrich:metrics > validator metrics 1`] = `
+{
+  "metrics": {
+    "apiRequests": 1,
+    "cacheCreationTokens": 200,
+    "cacheReadTokens": 9876,
+    "costUsd": 0.0432,
+    "durationMs": 8400,
+    "inputTokens": 12345,
+    "messages": 1,
+    "outputTokens": 678,
+    "toolUses": 3,
+  },
+  "phase": "validator",
+  "sessionId": "enrich_sess_42",
+}
+`;
+
+exports[`IPC channel payload snapshots > enrich:status > enricher idle (terminal) 1`] = `
+{
+  "phase": "enricher",
+  "sessionId": "enrich_sess_42",
+  "status": "idle",
+}
+`;
+
+exports[`IPC channel payload snapshots > enrich:status > validator running 1`] = `
+{
+  "phase": "validator",
+  "sessionId": "enrich_sess_42",
+  "status": "running",
+}
+`;
+
+exports[`IPC channel payload snapshots > enrich:status > validator waiting 1`] = `
+{
+  "phase": "validator",
+  "sessionId": "enrich_sess_42",
+  "status": "waiting",
+}
+`;
+
+exports[`IPC channel payload snapshots > enrich:stream > done chunk with output content 1`] = `
+{
+  "content": "Análise concluída. 3 gaps encontrados.",
+  "phase": "enricher",
+  "sessionId": "enrich_sess_42",
+  "type": "done",
+}
+`;
+
+exports[`IPC channel payload snapshots > enrich:stream > done chunk without content 1`] = `
+{
+  "phase": "enricher",
+  "sessionId": "enrich_sess_42",
+  "type": "done",
+}
+`;
+
+exports[`IPC channel payload snapshots > enrich:stream > text chunk 1`] = `
+{
+  "content": "Validando SPEC...",
+  "phase": "validator",
+  "sessionId": "enrich_sess_42",
+  "type": "text",
+}
+`;
+
+exports[`IPC channel payload snapshots > enrich:stream > tool_call chunk 1`] = `
+{
+  "phase": "validator",
+  "sessionId": "enrich_sess_42",
+  "tool": "Read",
+  "type": "tool_call",
+}
+`;
+
+exports[`IPC channel payload snapshots > harness:agent-stream > FLAT shape — planner local runtime (no event wrapper) 1`] = `
+{
+  "agent": "planner",
+  "content": "Planner local rodando...",
+  "projectId": "proj_123",
+  "type": "text",
+}
+`;
+
+exports[`IPC channel payload snapshots > harness:agent-stream > NESTED shape — coder text event with sprintId/round 1`] = `
+{
+  "agent": "coder",
+  "event": {
+    "content": "Implementando feature...",
+    "type": "text",
+  },
+  "projectId": "proj_123",
+  "round": 2,
+  "sprintId": "sprint_1",
+}
+`;
+
+exports[`IPC channel payload snapshots > harness:agent-stream > NESTED shape — coder text_delta (external API streaming) 1`] = `
+{
+  "agent": "coder",
+  "event": {
+    "content": "partial chunk",
+    "type": "text_delta",
+  },
+  "projectId": "proj_123",
+  "round": 2,
+  "sprintId": "sprint_1",
+}
+`;
+
+exports[`IPC channel payload snapshots > harness:agent-stream > NESTED shape — coder tool_call event 1`] = `
+{
+  "agent": "coder",
+  "event": {
+    "tool": "Edit",
+    "type": "tool_call",
+  },
+  "projectId": "proj_123",
+  "round": 2,
+  "sprintId": "sprint_1",
+}
+`;
+
+exports[`IPC channel payload snapshots > harness:agent-stream > NESTED shape — evaluator text event 1`] = `
+{
+  "agent": "evaluator",
+  "event": {
+    "content": "Avaliando criterios...",
+    "type": "text",
+  },
+  "projectId": "proj_123",
+  "round": 2,
+  "sprintId": "sprint_1",
+}
+`;
+
+exports[`IPC channel payload snapshots > harness:agent-stream > NESTED shape — planner text event 1`] = `
+{
+  "agent": "planner",
+  "event": {
+    "content": "Vou começar planejando...",
+    "type": "text",
+  },
+  "projectId": "proj_123",
+}
+`;
+
+exports[`IPC channel payload snapshots > harness:agent-stream > NESTED shape — planner thinking event 1`] = `
+{
+  "agent": "planner",
+  "event": {
+    "content": "Considerando arquitetura...",
+    "type": "thinking",
+  },
+  "projectId": "proj_123",
+}
+`;
+
+exports[`IPC channel payload snapshots > harness:agent-stream > NESTED shape — planner tool_use event 1`] = `
+{
+  "agent": "planner",
+  "event": {
+    "tool": "Glob",
+    "type": "tool_use",
+  },
+  "projectId": "proj_123",
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:audit-agent-progress > completed progress (with findings) 1`] = `
+{
+  "additionalFilesAfterStart": 5,
+  "agentId": "audit-secrets",
+  "agentName": "Secrets Hunter",
+  "costUsd": 0.0245,
+  "durationMs": 47300,
+  "filesAnalyzed": 42,
+  "findingsCount": 3,
+  "model": "claude-sonnet-4-5",
+  "projectId": "proj_456",
+  "slug": "secrets",
+  "status": "completed",
+  "toolCallsCount": 18,
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:audit-agent-progress > failed progress 1`] = `
+{
+  "additionalFilesAfterStart": 0,
+  "agentId": "audit-secrets",
+  "agentName": "Secrets Hunter",
+  "costUsd": 0,
+  "durationMs": 1200,
+  "filesAnalyzed": 42,
+  "findingsCount": undefined,
+  "model": "claude-sonnet-4-5",
+  "projectId": "proj_456",
+  "slug": "secrets",
+  "status": "failed",
+  "toolCallsCount": 2,
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:audit-agent-progress > running progress 1`] = `
+{
+  "additionalFilesAfterStart": 3,
+  "agentId": "audit-secrets",
+  "agentName": "Secrets Hunter",
+  "costUsd": 0,
+  "durationMs": 12500,
+  "filesAnalyzed": 42,
+  "findingsCount": undefined,
+  "model": "claude-sonnet-4-5",
+  "projectId": "proj_456",
+  "slug": "secrets",
+  "status": "running",
+  "toolCallsCount": 11,
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:phase-changed > completed (auto phase) 1`] = `
+{
+  "awaitingUser": false,
+  "phase": 2,
+  "phaseName": "Stories Generator",
+  "projectId": "proj_456",
+  "status": "completed",
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:phase-changed > completed (pipeline final, phase=null) 1`] = `
+{
+  "awaitingUser": false,
+  "phase": null,
+  "projectId": "proj_456",
+  "status": "completed",
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:phase-changed > interrupted (recovery on boot) 1`] = `
+{
+  "awaitingUser": true,
+  "phase": null,
+  "projectId": "proj_456",
+  "status": "interrupted",
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:phase-changed > loop-ready (loop phase) 1`] = `
+{
+  "awaitingUser": false,
+  "currentModel": "claude-sonnet-4-5",
+  "phase": 13,
+  "phaseName": "Coder",
+  "projectId": "proj_456",
+  "status": "loop-ready",
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:phase-changed > running (loop phase, round > 1) 1`] = `
+{
+  "awaitingUser": false,
+  "currentModel": "claude-sonnet-4-5",
+  "phase": 13,
+  "phaseName": "Coder",
+  "projectId": "proj_456",
+  "status": "running",
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:phase-changed > started (with currentModel) 1`] = `
+{
+  "awaitingUser": true,
+  "currentModel": "claude-sonnet-4-5",
+  "phase": 1,
+  "phaseName": "Discovery",
+  "projectId": "proj_456",
+  "status": "started",
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:project-updated > currentPhase null (pipeline finished) 1`] = `
+{
+  "patch": {
+    "currentPhase": null,
+  },
+  "projectId": "proj_456",
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:project-updated > status + currentPhase patch 1`] = `
+{
+  "patch": {
+    "currentPhase": 3,
+    "status": "running",
+  },
+  "projectId": "proj_456",
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:project-updated > status only patch 1`] = `
+{
+  "patch": {
+    "status": "done",
+  },
+  "projectId": "proj_456",
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:security-agent-status > completed (with findings) 1`] = `
+{
+  "agentId": "audit-secrets",
+  "agentName": "Secrets Hunter",
+  "findingsCount": 3,
+  "outputFile": "Security-scan_001-01-secrets.md",
+  "projectId": "proj_456",
+  "status": "completed",
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:security-agent-status > failed (with error) 1`] = `
+{
+  "agentId": "audit-secrets",
+  "agentName": "Secrets Hunter",
+  "error": "Timeout exceeded",
+  "projectId": "proj_456",
+  "status": "failed",
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:security-agent-status > running 1`] = `
+{
+  "agentId": "audit-secrets",
+  "agentName": "Secrets Hunter",
+  "projectId": "proj_456",
+  "status": "running",
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:stream > done chunk 1`] = `
+{
+  "phase": 4,
+  "projectId": "proj_456",
+  "type": "done",
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:stream > text chunk (regular phase) 1`] = `
+{
+  "content": "Gerando stories...",
+  "phase": 2,
+  "projectId": "proj_456",
+  "type": "text",
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:stream > text chunk from security audit (with auditAgentId/auditAgentSlug) 1`] = `
+{
+  "auditAgentId": "audit-secrets",
+  "auditAgentSlug": "secrets",
+  "content": "Analisando vulnerabilidades...",
+  "phase": 11,
+  "projectId": "proj_456",
+  "type": "text",
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:stream > thinking chunk (bridged from harness:agent-stream phase 11) 1`] = `
+{
+  "phase": 11,
+  "projectId": "proj_456",
+  "type": "thinking",
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:stream > tool_call chunk 1`] = `
+{
+  "phase": 4,
+  "projectId": "proj_456",
+  "tool": "Write",
+  "type": "tool_call",
+}
+`;
+
+exports[`IPC channel payload snapshots > pipeline:stream > tool_call chunk from security audit 1`] = `
+{
+  "auditAgentId": "audit-secrets",
+  "auditAgentSlug": "secrets",
+  "phase": 11,
+  "projectId": "proj_456",
+  "tool": "Grep",
+  "type": "tool_call",
+}
+`;

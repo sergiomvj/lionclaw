@@ -50,6 +50,9 @@ export function NewProjectModal({ onClose }: { onClose: () => void }) {
             .filter(Boolean),
         },
       });
+      if ('error' in result) {
+        return;
+      }
       await loadProjects();
       selectProject(result.projectId);
       onClose();

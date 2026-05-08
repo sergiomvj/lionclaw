@@ -19,13 +19,23 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { usePipelineStore } from '@/stores/pipeline-store';
 import type { SprintStatus } from '@/stores/pipeline-store';
+import { useActiveProjectState } from '@/hooks/useActiveProjectState';
 import { AgentThinking } from '@/components/chat/AgentThinking';
+import { shortenModel } from '@/utils/model-display';
 
 // ---- Constants ----
 
-// Phases used in the live pipeline loop (currentPhase values during sprint execution)
-const LOOP_CODER_PHASE = 13;
-const LOOP_EVALUATOR_PHASE = 14;
+// Phases used in the live pipeline loop (currentPhase values during sprint execution).
+// Sets accept both development (13/14) and security (10/11) pipeline numbers so the
+// same component works for either pipeline type.
+const LOOP_CODER_PHASES = new Set([13, 10]);
+const LOOP_EVALUATOR_PHASES = new Set([14, 11]);
+function isCoderPhase(phase: number | null): boolean {
+  return phase !== null && LOOP_CODER_PHASES.has(phase);
+}
+function isEvaluatorPhase(phase: number | null): boolean {
+  return phase !== null && LOOP_EVALUATOR_PHASES.has(phase);
+}
 
 // ---- Formatting helpers ----
 
@@ -101,10 +111,10 @@ function buildRoundsFromHistory(messages: PipelineSprintMessage[]): PersistedRou
     const entry = roundMap.get(ri)!;
     const toolCalls = (msg.toolCalls ?? []) as Array<{ tool: string; input: unknown }>;
 
-    if (msg.phaseNumber === LOOP_CODER_PHASE) {
+    if (isCoderPhase(msg.phaseNumber)) {
       entry.coderContent = msg.content;
       entry.coderToolCalls = toolCalls;
-    } else if (msg.phaseNumber === LOOP_EVALUATOR_PHASE) {
+    } else if (isEvaluatorPhase(msg.phaseNumber)) {
       entry.evaluatorContent = msg.content;
       entry.evaluatorToolCalls = toolCalls;
     }
@@ -296,15 +306,17 @@ interface LiveStreamPanelProps {
 }
 
 function LiveStreamPanel({ phase, stream }: LiveStreamPanelProps) {
-  const { streamContent, currentToolCalls, isStreaming } = usePipelineStore();
+  const streamContent = useActiveProjectState(s => s.streamContent) ?? '';
+  const currentToolCalls = useActiveProjectState(s => s.currentToolCalls) ?? [];
+  const isStreaming = useActiveProjectState(s => s.isStreaming) ?? false;
   const bottomRef = useRef<HTMLDivElement>(null);
 
   // If a dedicated stream array is provided (split-view), use it
   const useSplitView = stream !== undefined;
 
-  const agentLabel = phase === LOOP_CODER_PHASE ? 'Coder' : phase === LOOP_EVALUATOR_PHASE ? 'Evaluator' : `Fase ${phase}`;
-  const agentColor = phase === LOOP_CODER_PHASE ? getCoderColor() : getEvaluatorColor();
-  const agentBg = phase === LOOP_CODER_PHASE ? getCoderBg() : getEvaluatorBg();
+  const agentLabel = isCoderPhase(phase) ? 'Coder' : isEvaluatorPhase(phase) ? 'Evaluator' : `Fase ${phase}`;
+  const agentColor = isCoderPhase(phase) ? getCoderColor() : getEvaluatorColor();
+  const agentBg = isCoderPhase(phase) ? getCoderBg() : getEvaluatorBg();
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -439,8 +451,8 @@ interface RoundBadgeProps {
 }
 
 function RoundBadge({ roundNumber, totalRounds, isCurrent, phase }: RoundBadgeProps) {
-  const agentLabel = phase === LOOP_CODER_PHASE ? 'Coder' : phase === LOOP_EVALUATOR_PHASE ? 'Evaluator' : `Fase ${phase}`;
-  const agentColor = phase === LOOP_CODER_PHASE ? getCoderColor() : getEvaluatorColor();
+  const agentLabel = isCoderPhase(phase) ? 'Coder' : isEvaluatorPhase(phase) ? 'Evaluator' : `Fase ${phase}`;
+  const agentColor = isCoderPhase(phase) ? getCoderColor() : getEvaluatorColor();
 
   return (
     <div
@@ -518,7 +530,7 @@ interface RoundStatusBarProps {
   currentPhase: number | null;
 }
 
-function RoundStatusBar({ rounds, maxRounds, verdict, isActive, isStreaming, currentPhase }: RoundStatusBarProps) {
+function RoundStatusBar({ rounds, maxRounds, verdict, isActive, isStreaming: _isStreaming, currentPhase }: RoundStatusBarProps) {
   if (rounds === 0 && !isActive) return null;
 
   const isPass = verdict === 'pass' || verdict === 'passed' || verdict === 'accepted';
@@ -532,7 +544,7 @@ function RoundStatusBar({ rounds, maxRounds, verdict, isActive, isStreaming, cur
       {Array.from({ length: totalSlots }, (_, idx) => {
         const roundNum = idx + 1; // 1-indexed
         const isCompleted = roundNum <= rounds;
-        const isCurrent = isActive && roundNum === rounds + 1 && (currentPhase === LOOP_CODER_PHASE || currentPhase === LOOP_EVALUATOR_PHASE);
+        const isCurrent = isActive && roundNum === rounds + 1 && (isCoderPhase(currentPhase) || isEvaluatorPhase(currentPhase));
         const isPending = !isCompleted && !isCurrent;
 
         let circleClass = '';
@@ -591,7 +603,7 @@ interface SprintMetricsTabProps {
 }
 
 function SprintMetricsTab({ sprint, maxRounds, currentPhase, isActive, isStreaming }: SprintMetricsTabProps) {
-  const { phaseMetrics } = usePipelineStore();
+  const phaseMetrics = useActiveProjectState(s => s.phaseMetrics) ?? null;
 
   const raw = sprint.metrics as { coder?: Record<string, number>; evaluator?: Record<string, number> } | undefined;
   const coder = raw?.coder;
@@ -1087,8 +1099,28 @@ function SprintTabContent({
   totalSprints,
   projectId,
 }: SprintTabContentProps) {
-  const { isStreaming, abortPipeline, coderStream, evaluatorStream, loadSprintHistory, sprintHistoryCache } = usePipelineStore();
-  const isLoopPhase = currentPhase === LOOP_CODER_PHASE || currentPhase === LOOP_EVALUATOR_PHASE;
+  const isStreaming = useActiveProjectState(s => s.isStreaming) ?? false;
+  const coderStream = useActiveProjectState(s => s.coderStream) ?? [];
+  const evaluatorStream = useActiveProjectState(s => s.evaluatorStream) ?? [];
+  const metrics = useActiveProjectState(s => s.metrics) ?? null;
+  const abortPipeline = usePipelineStore(s => s.abortPipeline);
+
+  // Resolve model badges from phase metrics for this sprint.
+  // So mostra badge se a fase completou nessa execucao — caso contrario o badge
+  // mostraria dados de uma execucao anterior (ex: sonnet em rodada que falhou,
+  // depois usuario mudou pra codex e re-rodou; sem esse guard o badge mostraria
+  // 'sonnet' mesmo com codex em execucao).
+  const coderPhaseMetric = metrics?.phases.find(
+    (p) => (p.phaseNumber === 13 || p.phaseNumber === 10) && p.sprintIndex === sprintIndex,
+  );
+  const evaluatorPhaseMetric = metrics?.phases.find(
+    (p) => (p.phaseNumber === 14 || p.phaseNumber === 11) && p.sprintIndex === sprintIndex,
+  );
+  const coderModel = coderPhaseMetric?.status === 'completed' ? coderPhaseMetric.model ?? null : null;
+  const evaluatorModel = evaluatorPhaseMetric?.status === 'completed' ? evaluatorPhaseMetric.model ?? null : null;
+  const loadSprintHistory = usePipelineStore(s => s.loadSprintHistory);
+  const sprintHistoryCache = usePipelineStore(s => s.sprintHistoryCache);
+  const isLoopPhase = isCoderPhase(currentPhase) || isEvaluatorPhase(currentPhase);
   const sprintRunning = isActive && isLoopPhase;
 
   // Inner tab state: default to 'coder' for running, else available based on phase
@@ -1096,8 +1128,8 @@ function SprintTabContent({
 
   // When phase changes, switch inner tab
   useEffect(() => {
-    if (currentPhase === LOOP_CODER_PHASE) setInnerTab('coder');
-    else if (currentPhase === LOOP_EVALUATOR_PHASE) setInnerTab('evaluator');
+    if (isCoderPhase(currentPhase)) setInnerTab('coder');
+    else if (isEvaluatorPhase(currentPhase)) setInnerTab('evaluator');
   }, [currentPhase]);
 
   // ---- Load sprint history from DB on mount / sprintIndex change ----
@@ -1238,7 +1270,7 @@ function SprintTabContent({
   // During live streaming, only show the live panels (history will catch up after done).
   // After streaming ends, show persisted rounds.
   const showLiveCoder = isActive && isLoopPhase;
-  const showLiveEvaluator = isActive && (currentPhase === LOOP_EVALUATOR_PHASE || evaluatorStream.length > 0);
+  const showLiveEvaluator = isActive && (isEvaluatorPhase(currentPhase) || evaluatorStream.length > 0);
 
   // For persisted history: exclude rounds that are currently streaming (they'll be reloaded after done)
   // If currently streaming round N, we still show round N from DB if it exists (it won't until after done)
@@ -1276,10 +1308,15 @@ function SprintTabContent({
                 : 'text-zinc-500 hover:text-zinc-300'
             }`}
           >
-            {currentPhase === LOOP_CODER_PHASE && isStreaming && isActive && (
+            {isCoderPhase(currentPhase) && isStreaming && isActive && (
               <Loader2 size={9} className="animate-spin" />
             )}
             Coder
+            {coderModel && (
+              <span className="text-[10px] font-medium text-green-400 bg-green-500/10 border border-green-500/30 px-1.5 py-0.5 rounded font-mono">
+                {shortenModel(coderModel)}
+              </span>
+            )}
           </button>
         )}
         {showEvaluator && (
@@ -1291,10 +1328,15 @@ function SprintTabContent({
                 : 'text-zinc-500 hover:text-zinc-300'
             }`}
           >
-            {currentPhase === LOOP_EVALUATOR_PHASE && isStreaming && isActive && (
+            {isEvaluatorPhase(currentPhase) && isStreaming && isActive && (
               <Loader2 size={9} className="animate-spin" />
             )}
             Evaluator
+            {evaluatorModel && (
+              <span className="text-[10px] font-medium text-green-400 bg-green-500/10 border border-green-500/30 px-1.5 py-0.5 rounded font-mono">
+                {shortenModel(evaluatorModel)}
+              </span>
+            )}
           </button>
         )}
         {showMetricas && (
@@ -1323,7 +1365,7 @@ function SprintTabContent({
                 <RoundBadge
                   roundNumber={rounds + 1}
                   totalRounds={totalRounds}
-                  isCurrent={currentPhase === LOOP_CODER_PHASE}
+                  isCurrent={isCoderPhase(currentPhase)}
                   phase={currentPhase}
                 />
               </div>
@@ -1347,12 +1389,12 @@ function SprintTabContent({
 
             {/* Live stream for coder (shown during active coder phase) */}
             {showLiveCoder && coderStream.length > 0 && (
-              <LiveStreamPanel phase={LOOP_CODER_PHASE} stream={coderStream} />
+              <LiveStreamPanel phase={13} stream={coderStream} />
             )}
 
             {/* If streaming but no content yet */}
             {showLiveCoder && coderStream.length === 0 && isStreaming && (
-              <LiveStreamPanel phase={LOOP_CODER_PHASE} stream={coderStream} />
+              <LiveStreamPanel phase={13} stream={coderStream} />
             )}
 
             {/* Completed sprint summary (only when not showing persisted rounds) */}
@@ -1385,7 +1427,7 @@ function SprintTabContent({
 
             {/* Live stream for evaluator (shown during active evaluator phase) */}
             {showLiveEvaluator && (
-              <LiveStreamPanel phase={LOOP_EVALUATOR_PHASE} stream={evaluatorStream} />
+              <LiveStreamPanel phase={14} stream={evaluatorStream} />
             )}
 
             {/* Completed sprint summary (only when not showing persisted rounds) */}
@@ -1451,14 +1493,12 @@ export function SprintExecutionView({
   projectId,
 }: SprintExecutionViewProps) {
   // UI-18: use store-persisted selectedSprintTab so the selection survives remounts
-  const {
-    sprints,
-    currentPhase,
-    isStreaming,
-    selectedSprintTab,
-    setSelectedSprintTab,
-    pipelineSprintIndex,
-  } = usePipelineStore();
+  const sprints = useActiveProjectState(s => s.sprints) ?? [];
+  const currentPhase = useActiveProjectState(s => s.currentPhase) ?? null;
+  const isStreaming = useActiveProjectState(s => s.isStreaming) ?? false;
+  const selectedSprintTab = useActiveProjectState(s => s.selectedSprintTab) ?? 0;
+  const pipelineSprintIndex = useActiveProjectState(s => s.pipelineSprintIndex) ?? null;
+  const setSelectedSprintTab = usePipelineStore(s => s.setSelectedSprintTab);
 
   // UI-03: use backend-provided sprint index when available, fall back to heuristic
   const activeSprintIndex = (() => {
@@ -1496,7 +1536,7 @@ export function SprintExecutionView({
   // Clamp the selected tab to available range
   const clampedTab = Math.min(selectedSprintTab, sprintCount - 1);
 
-  const isExecuting = currentPhase === LOOP_CODER_PHASE || currentPhase === LOOP_EVALUATOR_PHASE;
+  const isExecuting = isCoderPhase(currentPhase) || isEvaluatorPhase(currentPhase);
 
   return (
     <div className="flex gap-3">

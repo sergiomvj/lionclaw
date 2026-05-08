@@ -11,6 +11,8 @@ export interface StreamCallbacks {
   onText?: (text: string) => void;
   onThinking?: (text: string) => void;
   onToolUse?: (toolName: string) => void;
+  /** Called on content_block_stop for tool_use blocks, with the full input parsed. */
+  onToolUseComplete?: (toolName: string, input: unknown) => void;
   onMessageStart?: (usage: { inputBase: number; cacheRead: number; cacheCreation: number }) => void;
   onMessageDelta?: (outputTokens: number) => void;
   onMessageStop?: () => void;
@@ -22,6 +24,8 @@ export interface StreamCallbacks {
 export interface StreamProcessorResult {
   output: string;
   metrics: StreamMetrics;
+  accumulatedText: string;
+  textBlocks: string[];
 }
 
 export async function processAgentStream(
@@ -35,6 +39,10 @@ export async function processAgentStream(
   };
   let output = '';
   let accumulatedText = '';
+  let currentBlock = '';
+  const textBlocks: string[] = [];
+  let currentToolName: string | null = null;
+  let currentToolInputJson = '';
 
   for await (const msg of stream) {
     if (callbacks.shouldAbort?.()) break;
@@ -47,16 +55,64 @@ export async function processAgentStream(
         if (delta.type === 'text_delta') {
           const text = delta.text as string;
           accumulatedText += text;
+          currentBlock += text;
           callbacks.onText?.(text);
         }
         else if (delta.type === 'thinking_delta') callbacks.onThinking?.(delta.thinking as string);
+        else if (delta.type === 'input_json_delta') {
+          const partial = delta.partial_json as string;
+          if (partial) currentToolInputJson += partial;
+        }
       }
 
       if (event.type === 'content_block_start') {
         const block = event.content_block as Record<string, unknown>;
         if (block?.type === 'tool_use') {
           metrics.toolUses++;
+          currentToolName = block.name as string;
+          currentToolInputJson = '';
+          // SDK may deliver a complete input object on the start event ONLY
+          // when there are no input_json_delta events to follow. If the start
+          // event carries an empty object {}, the actual input arrives via deltas
+          // and concatenating them with the {} prefix corrupts the JSON. So we
+          // ONLY use the start input when it is a non-empty object.
+          const initialInput = block.input;
+          if (
+            initialInput &&
+            typeof initialInput === 'object' &&
+            Object.keys(initialInput as object).length > 0
+          ) {
+            currentToolInputJson = JSON.stringify(initialInput);
+          }
           callbacks.onToolUse?.(block.name as string);
+        }
+      }
+
+      if (event.type === 'content_block_stop') {
+        if (currentBlock) {
+          textBlocks.push(currentBlock);
+          currentBlock = '';
+        }
+        if (currentToolName !== null) {
+          let parsedInput: unknown = null;
+          if (currentToolInputJson) {
+            try {
+              parsedInput = JSON.parse(currentToolInputJson);
+            } catch {
+              // Recovery: strip leading non-JSON garbage and try again
+              const match = currentToolInputJson.match(/\{[\s\S]*\}$/);
+              if (match) {
+                try {
+                  parsedInput = JSON.parse(match[0]);
+                } catch {
+                  parsedInput = null;
+                }
+              }
+            }
+          }
+          callbacks.onToolUseComplete?.(currentToolName, parsedInput);
+          currentToolName = null;
+          currentToolInputJson = '';
         }
       }
 
@@ -95,10 +151,15 @@ export async function processAgentStream(
     }
   }
 
+  // Flush any remaining block not closed by content_block_stop
+  if (currentBlock) {
+    textBlocks.push(currentBlock);
+  }
+
   // Fallback: if result event had empty output, use accumulated text from stream
   if (!output && accumulatedText) {
     output = accumulatedText;
   }
 
-  return { output, metrics };
+  return { output, metrics, accumulatedText, textBlocks };
 }

@@ -49,9 +49,6 @@ function formatDate(iso: string): string {
 
 type PrimaryTabId = 'documentos' | 'upload' | 'busca' | 'benchmark' | 'configuracoes' | 'graph';
 type GraphSubTabId = 'graph-view' | 'entities' | 'projects' | 'decisions' | 'meetings' | 'references' | 'graph-upload';
-type TabId = PrimaryTabId;
-
-const GRAPH_SUB_TAB_IDS: GraphSubTabId[] = ['graph-view', 'entities', 'projects', 'decisions', 'meetings', 'references', 'graph-upload'];
 
 const PRIMARY_TAB_CONFIG: Array<{ id: PrimaryTabId; label: string; icon: typeof BookOpen }> = [
   { id: 'documentos',    label: 'Documentos',    icon: FileText },

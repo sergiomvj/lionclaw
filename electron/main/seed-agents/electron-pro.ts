@@ -8,6 +8,7 @@
  */
 
 import type { AgentConfig } from '../../../src/types';
+import { GIT_RESTRICTIONS_BLOCK } from './_shared/git-restrictions';
 
 export const ELECTRON_PRO_ID = 'electron-pro';
 
@@ -63,7 +64,8 @@ export const electronPro: Omit<AgentConfig, 'sortOrder'> = {
 ## Regras absolutas
 
 - Codigo em ingles (variaveis, funcoes, tipos). Comunicacao em portugues brasileiro
-- NAO faca git commit ou git push
 - NAO instale dependencias sem necessidade direta
-- Siga os patterns e convencoes ja existentes no projeto`,
+- Siga os patterns e convencoes ja existentes no projeto
+
+${GIT_RESTRICTIONS_BLOCK}`,
 };

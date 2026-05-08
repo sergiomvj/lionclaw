@@ -3,14 +3,14 @@ import { Loader2 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { usePipelineStore } from '@/stores/pipeline-store';
-import type { PipelinePhaseNumber } from '@/types';
 import type { HarnessSprint } from '@/types';
 import { SprintsFormattedView } from './SprintsFormattedView';
+import { ArchitectureReviewArtifactView } from './ArchitectureReviewArtifactView';
 
 // ---- Props ----
 
 interface PhaseHistoryViewProps {
-  phase: PipelinePhaseNumber;
+  phase: number;
   projectId: string;
 }
 
@@ -29,7 +29,7 @@ export function PhaseHistoryView({ phase, projectId }: PhaseHistoryViewProps) {
 
   if (isLoading) {
     return (
-      <div className="flex items-center justify-center flex-1 text-zinc-600 text-sm gap-2 py-12">
+      <div className="flex items-center justify-center flex-1 min-h-0 text-zinc-600 text-sm gap-2 py-12">
         <Loader2 size={14} className="animate-spin" />
         <span>Carregando artefato...</span>
       </div>
@@ -39,8 +39,30 @@ export function PhaseHistoryView({ phase, projectId }: PhaseHistoryViewProps) {
   if (artifact.type === 'sprints') {
     const sprints = (artifact.sprints ?? []) as HarnessSprint[];
     return (
-      <div className="flex-1 overflow-y-auto px-4 py-4">
+      <div className="flex-1 min-h-0 overflow-y-auto px-4 py-4">
         <SprintsFormattedView sprints={sprints} />
+      </div>
+    );
+  }
+
+  if (artifact.type === 'architecture') {
+    // Architecture-review fases 1-4 (Map/Candidates/Diagnosis/Decisions): rich JSON view + MD fallback.
+    // No onSelectCandidate here — clicking on a past phase from the progress bar is a
+    // read-only revisit, not an active triage decision.
+    if (!artifact.markdown && !artifact.json) {
+      return (
+        <div className="flex items-center justify-center flex-1 min-h-0 py-12">
+          <p className="text-sm text-zinc-500">Ainda nao ha artefato para esta fase.</p>
+        </div>
+      );
+    }
+    return (
+      <div className="flex-1 min-h-0 overflow-y-auto">
+        <ArchitectureReviewArtifactView
+          phase={artifact.phase ?? phase}
+          markdownContent={artifact.markdown ?? null}
+          jsonContent={artifact.json ?? null}
+        />
       </div>
     );
   }
@@ -50,14 +72,14 @@ export function PhaseHistoryView({ phase, projectId }: PhaseHistoryViewProps) {
 
   if (!content.trim()) {
     return (
-      <div className="flex items-center justify-center flex-1 py-12">
+      <div className="flex items-center justify-center flex-1 min-h-0 py-12">
         <p className="text-sm text-zinc-500">Ainda nao ha artefato para esta fase.</p>
       </div>
     );
   }
 
   return (
-    <div className="flex-1 overflow-y-auto px-5 py-4">
+    <div className="flex-1 min-h-0 overflow-y-auto px-5 py-4">
       <div className="phase-artifact-markdown text-sm text-zinc-300 leading-relaxed max-w-4xl mx-auto">
         <ReactMarkdown remarkPlugins={[remarkGfm]}>{content}</ReactMarkdown>
       </div>

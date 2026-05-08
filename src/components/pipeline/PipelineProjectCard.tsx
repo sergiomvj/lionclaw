@@ -1,8 +1,21 @@
 import { useState } from 'react';
 import { Trash2, Loader2, CheckCircle2, XCircle, Circle, Minus } from 'lucide-react';
-import type { PipelineProject } from '@/types/pipeline';
+import type { PipelineProject, PipelineType, SecuritySummary } from '@/types/pipeline';
 import { PIPELINE_PHASES } from '@/types/pipeline';
 import { usePipelineStore } from '@/stores/pipeline-store';
+
+// ---- Pipeline type badge ----
+//
+// Visual differentiator on the project list so the user can tell at a glance
+// which pipeline (dev / security / feature / architecture-review) was run on
+// each project, without having to open them.
+
+const PIPELINE_TYPE_BADGE: Record<PipelineType, { label: string; color: string }> = {
+  development:           { label: 'DEV',      color: 'bg-blue-500/15 text-blue-300 border border-blue-500/30' },
+  security:              { label: 'SEC',      color: 'bg-red-500/15 text-red-300 border border-red-500/30' },
+  feature:               { label: 'FEAT',     color: 'bg-purple-500/15 text-purple-300 border border-purple-500/30' },
+  'architecture-review': { label: 'ARCH',     color: 'bg-amber-500/15 text-amber-300 border border-amber-500/30' },
+};
 
 // ---- Phase name helper ----
 
@@ -14,31 +27,37 @@ const TOTAL_PHASES = 11;
 
 // ---- Status types and labels ----
 
-type PipelineStatus = 'running' | 'paused' | 'done' | 'failed' | 'idle';
+type PipelineStatus = 'running' | 'paused' | 'done' | 'failed' | 'idle' | 'aborted' | 'interrupted';
 
 const STATUS_COLORS: Record<PipelineStatus, string> = {
-  running: 'bg-blue-500/20 text-blue-400',
-  paused:  'bg-yellow-500/20 text-yellow-400',
-  done:    'bg-green-500/20 text-green-400',
-  failed:  'bg-red-500/20 text-red-400',
-  idle:    'bg-zinc-500/20 text-zinc-400',
+  running:     'bg-blue-500/20 text-blue-400',
+  paused:      'bg-yellow-500/20 text-yellow-400',
+  done:        'bg-green-500/20 text-green-400',
+  failed:      'bg-red-500/20 text-red-400',
+  idle:        'bg-zinc-500/20 text-zinc-400',
+  aborted:     'bg-orange-500/20 text-orange-400',
+  interrupted: 'bg-purple-500/20 text-purple-400',
 };
 
 const STATUS_LABELS: Record<PipelineStatus, string> = {
-  running: 'Executando',
-  paused:  'Pausado',
-  done:    'Concluido',
-  failed:  'Falhou',
-  idle:    'Pendente',
+  running:     'Executando',
+  paused:      'Pausado',
+  done:        'Concluido',
+  failed:      'Falhou',
+  idle:        'Pendente',
+  aborted:     'Abortado',
+  interrupted: 'Interrompido',
 };
 
 function resolveStatus(status: string): PipelineStatus {
   switch (status) {
-    case 'running': return 'running';
-    case 'paused':  return 'paused';
-    case 'done':    return 'done';
-    case 'failed':  return 'failed';
-    default:        return 'idle';
+    case 'running':     return 'running';
+    case 'paused':      return 'paused';
+    case 'done':        return 'done';
+    case 'failed':      return 'failed';
+    case 'aborted':     return 'aborted';
+    case 'interrupted': return 'interrupted';
+    default:            return 'idle';
   }
 }
 
@@ -251,11 +270,27 @@ export function PipelineProjectCard({ project, onSelect }: PipelineProjectCardPr
         onClick={() => onSelect(project.id)}
         className="w-full text-left p-4 bg-zinc-900 border border-zinc-800 rounded-xl hover:border-zinc-700 hover:bg-zinc-900/80 transition-all group cursor-pointer"
       >
-        {/* Top row: name + status badge + delete */}
+        {/* Top row: name + pipeline type badge + status badge + delete */}
         <div className="flex items-start justify-between gap-3">
-          <h3 className="text-sm font-bold text-zinc-100 truncate group-hover:text-white transition-colors flex-1 min-w-0">
-            {project.name}
-          </h3>
+          <div className="flex items-center gap-2 flex-1 min-w-0">
+            <h3 className="text-sm font-bold text-zinc-100 truncate group-hover:text-white transition-colors min-w-0">
+              {project.name}
+            </h3>
+            {/* Pipeline type badge — defaults to 'development' for legacy rows without pipelineType set. */}
+            {(() => {
+              const type = (project.pipelineType ?? 'development') as PipelineType;
+              const cfg = PIPELINE_TYPE_BADGE[type];
+              if (!cfg) return null;
+              return (
+                <span
+                  title={`Pipeline: ${type}`}
+                  className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-semibold tracking-wide shrink-0 ${cfg.color}`}
+                >
+                  {cfg.label}
+                </span>
+              );
+            })()}
+          </div>
           <div className="flex items-center gap-2 shrink-0">
             <span
               className={`px-2 py-0.5 rounded text-[10px] font-semibold uppercase ${STATUS_COLORS[pipelineStatus]}`}
@@ -316,6 +351,12 @@ export function PipelineProjectCard({ project, onSelect }: PipelineProjectCardPr
               <span className="text-zinc-400 font-medium">
                 ${totalCost.toFixed(4)}
               </span>
+            </span>
+          )}
+          {/* Security pipeline: findings badge */}
+          {project.pipelineType === 'security' && meta.securitySummary !== undefined && meta.securitySummary !== null && (
+            <span className="text-[10px] text-red-400 font-medium">
+              {(meta.securitySummary as SecuritySummary).confirmedFindings ?? (meta.securitySummary as SecuritySummary).totalFindings ?? 0} findings
             </span>
           )}
           {totalSprints === null && totalFeatures === null && totalCost === null && phaseLabel === null && (

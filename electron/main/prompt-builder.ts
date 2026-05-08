@@ -5,7 +5,8 @@ import { getAllAgents, getAgent, getSetting, getCompletedDocsCount } from './db'
 import { getAllMCPServers } from './mcp-manager';
 import { getLionClawHome } from './paths';
 import { buildSkillsPromptSection, buildAgentSkillsPromptSection } from './skills';
-import { getLocalAgentsDescription } from './local-agent-tools';
+import { getLocalAgentsDescription, getExternalAgentsDescription } from './local-agent-tools';
+import { getCodexAgentsDescription } from './codex-agent-tools';
 
 // ---- Helpers ----
 
@@ -177,11 +178,25 @@ function buildSubagentsSection(): string {
     parts.push(localAgentsDesc);
   }
 
+  // External agents (via run_external_agent MCP tool)
+  const externalAgentsDesc = getExternalAgentsDescription();
+  if (externalAgentsDesc) {
+    parts.push(externalAgentsDesc);
+  }
+
+  // Codex agents (via run_codex_agent in-process MCP tool)
+  const codexAgentsDesc = getCodexAgentsDescription();
+  if (codexAgentsDesc) {
+    parts.push(codexAgentsDesc);
+  }
+
   parts.push('## Quando delegar');
   parts.push('- Tarefa trivial (saudacao, pergunta rapida) -> responda voce mesmo');
   parts.push('- Tarefa que precisa de especialista -> delegue para o subagente adequado');
   parts.push('- Agentes locais (run_local_agent) tem custo zero mas podem ser mais lentos e menos capazes');
   parts.push('- Prefira agentes locais para tarefas simples (resumos, traducao, geracao de texto basico)');
+  parts.push('- Agentes externos (run_external_agent) usam APIs externas (OpenRouter, OpenAI) com custo por token');
+  parts.push('- Agentes codex (run_codex_agent) rodam via OpenAI Codex CLI com OAuth — custo coberto pela assinatura ChatGPT');
   parts.push('- Use agentes cloud (Task) para tarefas complexas que exigem tool use pesado');
   parts.push('- Nenhum subagente adequado -> execute voce mesmo');
   parts.push('- Sempre revise o resultado do subagente antes de enviar ao usuario');

@@ -9,6 +9,7 @@
  */
 
 import type { AgentConfig } from '../../../src/types';
+import { GIT_RESTRICTIONS_BLOCK } from './_shared/git-restrictions';
 
 export const SPEC_VALIDATOR_ENRICH_ID = 'spec-validator-enrich';
 
@@ -94,5 +95,7 @@ Identifique problemas em seis categorias:
 
 ## Idioma
 
-Toda comunicacao, relatorio e edicoes na SPEC devem ser em portugues brasileiro.`,
+Toda comunicacao, relatorio e edicoes na SPEC devem ser em portugues brasileiro.
+
+${GIT_RESTRICTIONS_BLOCK}`,
 };

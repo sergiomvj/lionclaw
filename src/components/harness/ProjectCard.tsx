@@ -4,6 +4,7 @@ import { useHarnessStore } from '@/stores/harness-store';
 import type { HarnessProject } from '@/types';
 
 const STATUS_COLORS: Record<HarnessProject['status'], string> = {
+  idle: 'bg-zinc-500/20 text-zinc-400',
   planning: 'bg-purple-500/20 text-purple-400',
   reviewing: 'bg-orange-500/20 text-orange-400',
   ready: 'bg-cyan-500/20 text-cyan-400',
@@ -11,9 +12,12 @@ const STATUS_COLORS: Record<HarnessProject['status'], string> = {
   paused: 'bg-yellow-500/20 text-yellow-400',
   done: 'bg-green-500/20 text-green-400',
   failed: 'bg-red-500/20 text-red-400',
+  aborted: 'bg-orange-600/20 text-orange-500',
+  interrupted: 'bg-amber-600/20 text-amber-500',
 };
 
 const STATUS_LABELS: Record<HarnessProject['status'], string> = {
+  idle: 'Inativo',
   planning: 'Planejando',
   reviewing: 'Em revisao',
   ready: 'Pronto',
@@ -21,6 +25,8 @@ const STATUS_LABELS: Record<HarnessProject['status'], string> = {
   paused: 'Pausado',
   done: 'Concluido',
   failed: 'Falhou',
+  aborted: 'Abortado',
+  interrupted: 'Interrompido',
 };
 
 export function ProjectCard({ project }: { project: HarnessProject }) {

@@ -200,7 +200,14 @@ export function PipelineChatView({
     phaseDocuments,
     sendMessage,
     setViewingPhase,
+    isConversationPhase,
+    activeProjectId,
+    projects,
   } = usePipelineStore();
+
+  const activeProject = projects.find((p) => p.id === activeProjectId);
+  const pipelineType = activeProject?.pipelineType ?? 'dev';
+  const isAutoPhase = !isConversationPhase(currentPhase, pipelineType);
 
   const messages = getCurrentMessages();
   const isViewingHistory = viewingPhase !== null && viewingPhase !== currentPhase;
@@ -370,7 +377,7 @@ export function PipelineChatView({
   const viewPhaseForDoc = displayPhase;
   const hasPhaseDoc = viewPhaseForDoc !== null && phaseDocuments[viewPhaseForDoc] != null;
 
-  const canSend = (input.trim().length > 0 || attachments.length > 0) && !isStreaming && !isPaused && !isViewingHistory;
+  const canSend = (input.trim().length > 0 || attachments.length > 0) && !isStreaming && !isPaused && !isViewingHistory && !isAutoPhase;
 
   return (
     <div
@@ -520,14 +527,16 @@ export function PipelineChatView({
                 onKeyDown={handleKeyDown}
                 onPaste={handlePaste}
                 placeholder={
-                  isStreaming
+                  isAutoPhase
+                    ? 'Esta fase nao aceita mensagens (auto). Aguarde o agente.'
+                    : isStreaming
                     ? 'Aguardando agente...'
                     : isPaused
                     ? 'Pipeline pausado...'
                     : 'Mensagem para o pipeline...'
                 }
                 rows={1}
-                disabled={isStreaming || isPaused}
+                disabled={isStreaming || isPaused || isAutoPhase}
                 className="flex-1 bg-transparent text-sm text-zinc-100 placeholder-zinc-600 resize-none outline-none disabled:opacity-40"
                 style={{ minHeight: '24px', maxHeight: '144px' }}
               />

@@ -269,7 +269,7 @@ export function MemoryPage() {
           className="flex-1 flex items-center gap-0.5 overflow-x-auto scrollbar-hide p-1"
           style={{ scrollbarWidth: 'none', msOverflowStyle: 'none' }}
         >
-          {visibleTabs.map((cfg, idx) => {
+          {visibleTabs.map((cfg) => {
             const { id, label, icon: Icon } = cfg;
             const dirty = isDirty(id);
             const isActive = tab === id;

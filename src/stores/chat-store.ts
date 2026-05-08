@@ -33,6 +33,16 @@ interface ChatState {
   clearDraft: (sessionId: string) => void;
 }
 
+function isDesktopSession(session: ChatSession): boolean {
+  return (session.type === 'chat' || session.type === 'manual')
+    && !session.taskId
+    && !session.title?.startsWith('[Scheduler]');
+}
+
+function isActiveDesktopSession(session: ChatSession): boolean {
+  return session.status === 'active' && isDesktopSession(session);
+}
+
 export const useChatStore = create<ChatState>((set, get) => ({
   sessions: [],
   currentSessionId: null,
@@ -51,23 +61,30 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   loadSessions: async () => {
     const allSessions = await window.lionclaw.chat.getSessions();
-    const base = allSessions.slice(0, 4);
+    const desktopSessions = allSessions.filter(isDesktopSession);
+    const base = desktopSessions.slice(0, 4);
     const { currentSessionId } = get();
+    const activeDesktopSession = desktopSessions.find(isActiveDesktopSession);
 
     // Keep the currently selected session visible even if it falls outside the top 4.
     const current =
       currentSessionId && !base.find((s) => s.id === currentSessionId)
-        ? allSessions.find((s) => s.id === currentSessionId)
+        ? desktopSessions.find((s) => s.id === currentSessionId)
         : undefined;
-    const visibleSessions = current ? [current, ...base.slice(0, 3)] : base;
+    const preferred =
+      !currentSessionId && activeDesktopSession && !base.find((s) => s.id === activeDesktopSession.id)
+        ? activeDesktopSession
+        : undefined;
+    const visibleSessions = current
+      ? [current, ...base.filter((s) => s.id !== current.id).slice(0, 3)]
+      : preferred
+        ? [preferred, ...base.filter((s) => s.id !== preferred.id).slice(0, 3)]
+        : base;
 
-    if (!currentSessionId && visibleSessions.length > 0) {
-      const active = visibleSessions.find((s) => s.status === 'active');
-      if (active) {
-        const messages = await window.lionclaw.chat.getMessages(active.id);
-        set({ sessions: visibleSessions, currentSessionId: active.id, messages });
-        return;
-      }
+    if (!currentSessionId && activeDesktopSession) {
+      const messages = await window.lionclaw.chat.getMessages(activeDesktopSession.id);
+      set({ sessions: visibleSessions, currentSessionId: activeDesktopSession.id, messages });
+      return;
     }
 
     set({ sessions: visibleSessions });
@@ -287,7 +304,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
 
   startNewSession: async () => {
     const sessions = await window.lionclaw.chat.getSessions();
-    const active = sessions.find((s) => s.status === 'active');
+    const active = sessions.find(isActiveDesktopSession);
 
     if (active) {
       const messages = await window.lionclaw.chat.getMessages(active.id);

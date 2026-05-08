@@ -54,6 +54,11 @@ const STATUS_CONFIG: Record<
     badge: 'bg-zinc-800 text-zinc-600',
     label: 'Pulado',
   },
+  rejected: {
+    icon: <XCircle size={14} className="text-orange-400" />,
+    badge: 'bg-orange-500/20 text-orange-400',
+    label: 'Rejeitado',
+  },
 };
 
 const COMPLEXITY_COLORS = {

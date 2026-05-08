@@ -1,9 +1,12 @@
 import { createLogger } from './logger';
-import { executeLocalTool } from './local-tool-executor';
+import { executeLocalTool, executeToolDispatch } from './local-tool-executor';
+import type { LocalLLMProvider, ExternalProvider, LLMProvider } from '../../src/types';
+import type { McpServerSpec, McpSessionClient } from './mcp-tool-bridge';
+
+// Re-export so callers that previously imported these from ollama-client continue to work.
+export type { LocalLLMProvider, ExternalProvider, LLMProvider };
 
 const logger = createLogger('local-llm');
-
-export type LocalLLMProvider = 'ollama' | 'lmstudio' | 'openai-compatible';
 
 const TIMEOUT_MS = 30_000;
 
@@ -27,6 +30,7 @@ export async function checkOllamaAvailable(
   baseUrl: string,
   model: string,
   provider: LocalLLMProvider = 'ollama',
+  authHeaders?: Record<string, string>,
 ): Promise<{ available: boolean; models: string[] }> {
   try {
     if (provider === 'ollama') {
@@ -37,7 +41,10 @@ export async function checkOllamaAvailable(
       const available = models.some((m) => m.startsWith(model.split(':')[0]));
       return { available, models };
     } else {
-      const res = await fetchWithTimeout(`${baseUrl}/v1/models`, { method: 'GET' });
+      const res = await fetchWithTimeout(`${baseUrl}/v1/models`, {
+        method: 'GET',
+        headers: { ...authHeaders },
+      });
       if (!res.ok) return { available: false, models: [] };
       const json = (await res.json()) as { data?: Array<{ id: string }> };
       const models = json.data?.map((m) => m.id) ?? [];
@@ -107,7 +114,10 @@ export async function ollamaChat(
   provider: LocalLLMProvider = 'ollama',
 ): Promise<string> {
   const isOllama = provider === 'ollama';
-  const url = isOllama ? `${baseUrl}/api/chat` : `${baseUrl}/v1/chat/completions`;
+  const trimmed = baseUrl.replace(/\/+$/, '');
+  const url = isOllama
+    ? `${trimmed}/api/chat`
+    : (trimmed.endsWith('/v1') ? `${trimmed}/chat/completions` : `${trimmed}/v1/chat/completions`);
 
   const body: Record<string, unknown> = {
     model,
@@ -164,9 +174,9 @@ interface OllamaToolCall {
 }
 
 /** Mensagem no historico de conversa para /api/chat */
-interface OllamaChatMessage {
+export interface OllamaChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string;
+  content: string | null;
   tool_calls?: OllamaToolCall[];
   tool_call_id?: string;
 }
@@ -181,6 +191,10 @@ interface OllamaChatApiResponse {
   eval_count?: number;
   prompt_eval_count?: number;
   done?: boolean;
+  /** Custo real cobrado pelo provider externo (ex: OpenRouter) em USD */
+  reported_cost_usd?: number;
+  /** Tokens servidos do cache do provider (ex: DeepSeek, MiniMax) */
+  cache_hit_tokens?: number;
 }
 
 /** Registro de uma tool executada durante a sessao */
@@ -198,6 +212,12 @@ export interface OllamaChatResult {
   tokensUsed: number;
   promptTokens: number;
   toolCalls: OllamaToolCallRecord[];
+  /** Tokens servidos do cache do provider externo (acumulado entre rounds) */
+  cacheHitTokens?: number;
+  /** Custo real cobrado pelo provider externo em USD (acumulado entre rounds) */
+  reportedCostUsd?: number;
+  /** Numero de chamadas HTTP realizadas (1 por round) */
+  apiRequests: number;
 }
 
 /** Opcoes para ollamaChatWithTools */
@@ -208,12 +228,46 @@ export interface OllamaChatWithToolsOptions {
   temperature?: number;
   /** Diretorio de trabalho para ferramentas de filesystem/shell */
   cwd?: string;
-  /** Callback chamado a cada chunk de texto gerado pelo modelo */
+  /** Callback chamado ao fim de cada round com o texto completo acumulado */
   onText?: (chunk: string) => void;
+  /** Callback chamado por token gerado (ativo apenas quando streaming === true) */
+  onTextDelta?: (chunk: string) => void;
   /** Callback chamado ao executar uma tool */
   onToolUse?: (record: OllamaToolCallRecord) => void;
-  /** Provider do modelo local (default: 'ollama') */
-  provider?: LocalLLMProvider;
+  /** Provider do modelo (default: 'ollama') */
+  provider?: LLMProvider;
+  /** Headers de autenticacao para providers externos */
+  authHeaders?: Record<string, string>;
+  /** Numero maximo de tokens na resposta */
+  maxTokens?: number;
+  /** Ativa SSE streaming por token (default: false, usa non-streaming) */
+  streaming?: boolean;
+  /**
+   * Historico de turnos anteriores da mesma conversa (multi-turn).
+   * Inserido entre o system prompt e o user prompt atual.
+   * Necessario no path external porque a chamada HTTP e stateless.
+   */
+  priorMessages?: OllamaChatMessage[];
+  /**
+   * Parametros extras a serem incluidos no body do request (spread).
+   * Usado pelo path external para reasoning params (reasoning_effort, thinking, etc.)
+   * que variam por provider e modelo. Path local e cloud nunca passam este campo.
+   */
+  extraBodyParams?: Partial<Record<string, unknown>>;
+  /**
+   * MCP servers a serem ativados para esta sessao (path external apenas).
+   *
+   * Quando presente, setupMCPsForSession e chamado antes do loop de tool-calling
+   * e teardownMCPsForSession e chamado no finally. Tools MCP sao mescladas com as
+   * builtin tools passadas em `tools`.
+   *
+   * Quando ausente (undefined), comportamento identico ao codigo anterior:
+   * nenhum MCP e iniciado, executeLocalTool e chamado diretamente no loop.
+   * O path local (Ollama/LM Studio) nunca passa este campo.
+   *
+   * Mesmo formato que resolveMCPsForHarnessAgent retorna e que o SDK Claude consome.
+   */
+  mcpServers?: Record<string, McpServerSpec>;
 }
 
 // Timeout generoso para modelos locais que podem ser lentos
@@ -225,27 +279,41 @@ async function fetchChatNonStreaming(
   model: string,
   tools: OllamaToolSchema[] | undefined,
   temperature: number | undefined,
-  provider: LocalLLMProvider = 'ollama',
+  provider: LLMProvider,
+  authHeaders?: Record<string, string>,
+  maxTokens?: number,
+  extraBodyParams?: Partial<Record<string, unknown>>,
 ): Promise<OllamaChatApiResponse> {
   const isOllama = provider === 'ollama';
-  const url = isOllama ? `${baseUrl}/api/chat` : `${baseUrl}/v1/chat/completions`;
+  const trimmed = baseUrl.replace(/\/+$/, '');
+  const url = isOllama
+    ? `${trimmed}/api/chat`
+    : (trimmed.endsWith('/v1') ? `${trimmed}/chat/completions` : `${trimmed}/v1/chat/completions`);
 
   const body: Record<string, unknown> = {
     model,
     messages,
     stream: false,
+    ...(extraBodyParams ?? {}),
   };
 
   if (tools && tools.length > 0) {
     body.tools = tools;
   }
 
+  // OpenRouter-specific: automatic provider fallback on transient errors.
+  if (provider === 'openrouter') {
+    body.provider = { allow_fallbacks: true };
+  }
+
   if (isOllama) {
     const options: Record<string, unknown> = {};
     if (temperature !== undefined) options.temperature = temperature;
+    if (maxTokens !== undefined) options.num_predict = maxTokens;
     if (Object.keys(options).length > 0) body.options = options;
   } else {
     if (temperature !== undefined) body.temperature = temperature;
+    if (maxTokens !== undefined) body.max_tokens = maxTokens;
   }
 
   const controller = new AbortController();
@@ -254,7 +322,10 @@ async function fetchChatNonStreaming(
   try {
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...authHeaders,
+      },
       body: JSON.stringify(body),
       signal: controller.signal,
     });
@@ -272,7 +343,14 @@ async function fetchChatNonStreaming(
     const choices = data.choices as Array<{
       message: { content?: string; tool_calls?: Array<{ id?: string; function: { name: string; arguments: string | Record<string, unknown> } }> }
     }> | undefined;
-    const usage = data.usage as { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | undefined;
+    const usage = data.usage as {
+      prompt_tokens?: number;
+      completion_tokens?: number;
+      total_tokens?: number;
+      cost?: number;                    // OpenRouter: custo real cobrado em USD
+      prompt_cache_hit_tokens?: number; // DeepSeek: tokens servidos do cache
+      cache_hit_tokens?: number;        // MiniMax: tokens servidos do cache
+    } | undefined;
 
     const rawToolCalls = choices?.[0]?.message?.tool_calls;
     const toolCalls: OllamaToolCall[] | undefined = rawToolCalls?.map((tc) => ({
@@ -280,7 +358,7 @@ async function fetchChatNonStreaming(
       function: {
         name: tc.function.name,
         arguments: typeof tc.function.arguments === 'string'
-          ? JSON.parse(tc.function.arguments)
+          ? (() => { try { return JSON.parse(tc.function.arguments as string); } catch { return {}; } })()
           : tc.function.arguments,
       },
     }));
@@ -293,6 +371,222 @@ async function fetchChatNonStreaming(
       },
       eval_count: usage?.completion_tokens ?? usage?.total_tokens,
       prompt_eval_count: usage?.prompt_tokens,
+      cache_hit_tokens: usage?.prompt_cache_hit_tokens ?? usage?.cache_hit_tokens,
+      reported_cost_usd: usage?.cost,
+      done: true,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/**
+ * Chat com streaming SSE e acumulacao de tool_call deltas.
+ *
+ * Usado pelo path external (providers com suporte a SSE e tool calling).
+ * O path local (Ollama nativo) continua usando fetchChatNonStreaming.
+ *
+ * Requer `stream_options: { include_usage: true }` no body para capturar
+ * tokens e custo no evento final do stream.
+ */
+async function fetchChatStreamingWithTools(
+  baseUrl: string,
+  messages: OllamaChatMessage[],
+  model: string,
+  tools: OllamaToolSchema[] | undefined,
+  temperature: number | undefined,
+  provider: LLMProvider,
+  authHeaders?: Record<string, string>,
+  maxTokens?: number,
+  onTextDelta?: (chunk: string) => void,
+  extraBodyParams?: Partial<Record<string, unknown>>,
+): Promise<OllamaChatApiResponse> {
+  const url = baseUrl.replace(/\/+$/, '').endsWith('/v1')
+    ? `${baseUrl.replace(/\/+$/, '')}/chat/completions`
+    : `${baseUrl.replace(/\/+$/, '')}/v1/chat/completions`;
+
+  const body: Record<string, unknown> = {
+    model,
+    messages,
+    stream: true,
+    stream_options: { include_usage: true },
+    ...(extraBodyParams ?? {}),
+  };
+
+  if (tools && tools.length > 0) body.tools = tools;
+  if (temperature !== undefined) body.temperature = temperature;
+  if (maxTokens !== undefined) body.max_tokens = maxTokens;
+
+  // OpenRouter-specific: enable automatic provider fallback so transient 5xx
+  // from one upstream provider (e.g. Together) auto-routes to the next without
+  // bubbling the error to us. Other OpenAI-compatible providers ignore this field.
+  if (provider === 'openrouter') {
+    body.provider = { allow_fallbacks: true };
+  }
+
+  logger.info(
+    {
+      url,
+      model,
+      provider,
+      toolCount: tools?.length ?? 0,
+      toolNames: tools?.map((t) => t.function.name) ?? [],
+      firstToolSample: tools?.[0],
+      bodyKeys: Object.keys(body),
+      messageCount: messages.length,
+    },
+    'External request: outbound body summary',
+  );
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CHAT_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...authHeaders },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    if (!res.ok) {
+      const text = await res.text().catch(() => '');
+      throw new Error(`${provider} ${url} HTTP ${res.status}: ${text.substring(0, 300)}`);
+    }
+
+    if (!res.body) throw new Error('Response body is null');
+
+    // Acumuladores para o stream
+    let accumulatedContent = '';
+    const accumulatedToolCalls: Array<{
+      id?: string;
+      type?: string;
+      function: { name: string; arguments: string };
+    }> = [];
+    let usage:
+      | {
+          prompt_tokens?: number;
+          completion_tokens?: number;
+          total_tokens?: number;
+          cost?: number;
+          prompt_cache_hit_tokens?: number;
+          cache_hit_tokens?: number;
+        }
+      | undefined;
+
+    // Parser SSE linha a linha
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const payload = line.slice(6).trim();
+        if (payload === '[DONE]') continue;
+
+        let event: Record<string, unknown>;
+        try {
+          event = JSON.parse(payload) as Record<string, unknown>;
+        } catch {
+          continue;
+        }
+
+        // Captura usage (vem no ultimo evento quando include_usage: true)
+        if (event.usage) {
+          usage = event.usage as typeof usage;
+        }
+
+        const choices = event.choices as Array<{
+          delta?: {
+            content?: string;
+            tool_calls?: Array<{
+              index?: number;
+              id?: string;
+              type?: string;
+              function?: { name?: string; arguments?: string };
+            }>;
+          };
+        }> | undefined;
+
+        const choice = choices?.[0];
+        if (!choice) continue;
+        const delta = choice.delta;
+        if (!delta) continue;
+
+        // Content delta: acumula e emite per-token callback
+        if (typeof delta.content === 'string' && delta.content.length > 0) {
+          accumulatedContent += delta.content;
+          if (onTextDelta) onTextDelta(delta.content);
+        }
+
+        // Tool call deltas: acumula por index, concatenando fragments
+        if (Array.isArray(delta.tool_calls)) {
+          for (const tcDelta of delta.tool_calls) {
+            const idx = tcDelta.index ?? 0;
+            if (!accumulatedToolCalls[idx]) {
+              accumulatedToolCalls[idx] = { function: { name: '', arguments: '' } };
+            }
+            const slot = accumulatedToolCalls[idx];
+            if (tcDelta.id) slot.id = tcDelta.id;
+            if (tcDelta.type) slot.type = tcDelta.type;
+            if (tcDelta.function?.name) slot.function.name += tcDelta.function.name;
+            if (tcDelta.function?.arguments) slot.function.arguments += tcDelta.function.arguments;
+          }
+        }
+      }
+    }
+
+    // Parse tool_calls acumulados com try/catch defensivo
+    const toolCalls: OllamaToolCall[] | undefined =
+      accumulatedToolCalls.length > 0
+        ? accumulatedToolCalls.map((tc) => ({
+            id: tc.id,
+            function: {
+              name: tc.function.name,
+              arguments: (() => {
+                try {
+                  return JSON.parse(tc.function.arguments) as Record<string, unknown>;
+                } catch {
+                  return {};
+                }
+              })(),
+            },
+          }))
+        : undefined;
+
+    logger.info(
+      {
+        model,
+        provider,
+        contentLen: accumulatedContent.length,
+        contentPreview: accumulatedContent.slice(0, 200),
+        toolCallsRequested: toolCalls?.length ?? 0,
+        toolCallNames: toolCalls?.map((tc) => tc.function.name) ?? [],
+        usagePresent: !!usage,
+        promptTokens: usage?.prompt_tokens,
+        completionTokens: usage?.completion_tokens,
+      },
+      'External request: stream finished, response summary',
+    );
+
+    return {
+      model,
+      message: {
+        content: accumulatedContent,
+        tool_calls: toolCalls && toolCalls.length > 0 ? toolCalls : undefined,
+      },
+      eval_count: usage?.completion_tokens ?? usage?.total_tokens,
+      prompt_eval_count: usage?.prompt_tokens,
+      cache_hit_tokens: usage?.prompt_cache_hit_tokens ?? usage?.cache_hit_tokens,
+      reported_cost_usd: usage?.cost,
       done: true,
     };
   } finally {
@@ -327,109 +621,240 @@ export async function ollamaChatWithTools(
     temperature,
     cwd = process.cwd(),
     onText,
+    onTextDelta,
     onToolUse,
     provider = 'ollama',
+    authHeaders,
+    maxTokens,
+    streaming = false,
+    mcpServers,
+    extraBodyParams,
   } = options;
+
+  // ---- MCP setup (path external apenas) ----
+  // Quando mcpServers nao e passado (undefined), nenhum MCP e iniciado e o
+  // comportamento e identico ao codigo anterior. O path local nunca passa
+  // mcpServers, portanto este bloco nunca executa para ele.
+  let mcpClient: McpSessionClient | undefined;
+  let mcpTools: OllamaToolSchema[] = [];
+
+  if (mcpServers && Object.keys(mcpServers).length > 0) {
+    const { setupMCPsForSession } = await import('./mcp-tool-bridge');
+    const setup = await setupMCPsForSession(mcpServers);
+    mcpClient = setup.client;
+    mcpTools = setup.tools;
+    logger.info({ mcpToolCount: mcpTools.length }, 'MCP tools merged into session');
+  }
+
+  // Mescla tools builtin com tools MCP (quando presentes)
+  const allTools: OllamaToolSchema[] = [...tools, ...mcpTools];
 
   const messages: OllamaChatMessage[] = [];
   if (systemPrompt) {
     messages.push({ role: 'system', content: systemPrompt });
+  }
+  if (options.priorMessages && options.priorMessages.length > 0) {
+    messages.push(...options.priorMessages);
   }
   messages.push({ role: 'user', content: prompt });
 
   const toolCallLog: OllamaToolCallRecord[] = [];
   let totalOutputTokens = 0;
   let totalPromptTokens = 0;
+  let totalCacheHitTokens = 0;
+  let totalReportedCostUsd = 0;
+  let roundCount = 0;
   let finalContent = '';
   let finalModel = model;
 
   logger.info(
-    { model, baseUrl, provider, tools: tools.map((t) => t.function.name), maxRounds },
+    { model, baseUrl, provider, tools: allTools.map((t) => t.function.name), maxRounds },
     'ollamaChatWithTools started',
   );
 
-  for (let round = 0; round < maxRounds; round++) {
-    const apiResponse = await fetchChatNonStreaming(
-      baseUrl,
-      messages,
-      model,
-      tools,
-      temperature,
-      provider,
-    );
+  try {
+    for (let round = 0; round < maxRounds; round++) {
+      const apiResponse = streaming
+        ? await fetchChatStreamingWithTools(
+            baseUrl,
+            messages,
+            model,
+            allTools,
+            temperature,
+            provider,
+            authHeaders,
+            maxTokens,
+            onTextDelta,
+            extraBodyParams,
+          )
+        : await fetchChatNonStreaming(
+            baseUrl,
+            messages,
+            model,
+            allTools,
+            temperature,
+            provider,
+            authHeaders,
+            maxTokens,
+            extraBodyParams,
+          );
 
-    totalOutputTokens += apiResponse.eval_count ?? 0;
-    totalPromptTokens += apiResponse.prompt_eval_count ?? 0;
-    finalModel = apiResponse.model || model;
+      roundCount += 1;
+      totalOutputTokens += apiResponse.eval_count ?? 0;
+      totalPromptTokens += apiResponse.prompt_eval_count ?? 0;
+      totalCacheHitTokens += apiResponse.cache_hit_tokens ?? 0;
+      totalReportedCostUsd += apiResponse.reported_cost_usd ?? 0;
+      finalModel = apiResponse.model || model;
 
-    const msgContent = apiResponse.message?.content ?? '';
-    const toolCalls = apiResponse.message?.tool_calls;
+      const msgContent = apiResponse.message?.content ?? '';
+      const toolCalls = apiResponse.message?.tool_calls;
 
-    // Sem tool calls = resposta final
-    if (!toolCalls || toolCalls.length === 0) {
-      finalContent = msgContent;
-      if (onText && msgContent) {
-        onText(msgContent);
+      // Sem tool calls = resposta final
+      if (!toolCalls || toolCalls.length === 0) {
+        finalContent = msgContent;
+        if (onText && msgContent) {
+          onText(msgContent);
+        }
+        logger.info({ round, model: finalModel }, 'ollamaChatWithTools finished (no more tool calls)');
+        break;
       }
-      logger.info({ round, model: finalModel }, 'ollamaChatWithTools finished (no more tool calls)');
-      break;
+
+      // Garante que cada tool call tem um ID (obrigatorio no padrao OpenAI/LM Studio)
+      const toolCallsWithIds = toolCalls.map((tc, i) => ({
+        ...tc,
+        id: tc.id ?? `call_${tc.function.name}_${Date.now()}_${i}`,
+      }));
+
+      // Adiciona resposta do assistente com tool calls ao historico
+      // Para OpenAI-compatible (LM Studio): arguments deve ser string JSON e content pode ser null
+      if (provider === 'ollama') {
+        messages.push({
+          role: 'assistant',
+          content: msgContent,
+          tool_calls: toolCallsWithIds,
+        });
+      } else {
+        messages.push({
+          role: 'assistant',
+          content: msgContent || null,
+          tool_calls: toolCallsWithIds.map(tc => ({
+            id: tc.id,
+            type: 'function' as const,
+            function: {
+              name: tc.function.name,
+              arguments: JSON.stringify(tc.function.arguments),
+            },
+          })),
+        } as unknown as OllamaChatMessage);
+      }
+
+      // Executa cada tool e adiciona resultado ao historico.
+      // Quando mcpClient esta presente (path external com MCPs), usa executeToolDispatch
+      // para rotear builtin vs MCP. Quando ausente (path local ou external sem MCPs),
+      // usa executeLocalTool diretamente (comportamento identico ao codigo anterior).
+      for (const call of toolCallsWithIds) {
+        const toolName = call.function.name;
+        const toolArgs = call.function.arguments;
+
+        logger.info({ tool: toolName, round }, 'Executing tool call');
+
+        let toolOutput: string;
+        let toolIsError: boolean;
+
+        if (mcpClient) {
+          // Path external com MCPs: dispatcher unificado
+          try {
+            const dispatchResult = await executeToolDispatch(toolName, toolArgs, cwd, mcpClient);
+            // Normaliza resultado para string (builtin retorna LocalToolResult, MCP retorna unknown)
+            if (
+              dispatchResult !== null &&
+              typeof dispatchResult === 'object' &&
+              'result' in (dispatchResult as Record<string, unknown>) &&
+              'isError' in (dispatchResult as Record<string, unknown>)
+            ) {
+              const r = dispatchResult as { result: string; isError: boolean };
+              toolOutput = r.result;
+              toolIsError = r.isError;
+            } else {
+              toolOutput = typeof dispatchResult === 'string'
+                ? dispatchResult
+                : JSON.stringify(dispatchResult);
+              toolIsError = false;
+            }
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            toolOutput = `Error ao executar tool ${toolName}: ${msg}`;
+            toolIsError = true;
+          }
+        } else {
+          // Path local ou external sem MCPs: comportamento original
+          const toolResult = await executeLocalTool(toolName, toolArgs, cwd);
+          toolOutput = toolResult.result;
+          toolIsError = toolResult.isError;
+        }
+
+        const record: OllamaToolCallRecord = {
+          tool: toolName,
+          input: toolArgs,
+          output: toolOutput,
+          isError: toolIsError,
+        };
+        toolCallLog.push(record);
+
+        if (onToolUse) {
+          onToolUse(record);
+        }
+
+        messages.push({
+          role: 'tool',
+          content: toolOutput,
+          tool_call_id: call.id,
+        });
+      }
+
+      // Se chegamos ao ultimo round sem resposta final, forca uma ultima chamada sem tools
+      if (round === maxRounds - 1) {
+        logger.warn({ model, maxRounds }, 'Max rounds reached, forcing final response without tools');
+        const finalResponse = streaming
+          ? await fetchChatStreamingWithTools(
+              baseUrl,
+              messages,
+              model,
+              undefined,
+              temperature,
+              provider,
+              authHeaders,
+              maxTokens,
+              onTextDelta,
+              extraBodyParams,
+            )
+          : await fetchChatNonStreaming(
+              baseUrl,
+              messages,
+              model,
+              undefined,
+              temperature,
+              provider,
+              authHeaders,
+              maxTokens,
+              extraBodyParams,
+            );
+        roundCount += 1;
+        finalContent = finalResponse.message?.content ?? '[Limite de rounds atingido sem resposta final]';
+        totalOutputTokens += finalResponse.eval_count ?? 0;
+        totalPromptTokens += finalResponse.prompt_eval_count ?? 0;
+        totalCacheHitTokens += finalResponse.cache_hit_tokens ?? 0;
+        totalReportedCostUsd += finalResponse.reported_cost_usd ?? 0;
+        if (onText && finalContent) {
+          onText(finalContent);
+        }
+      }
     }
-
-    // Adiciona resposta do assistente com tool calls ao historico
-    messages.push({
-      role: 'assistant',
-      content: msgContent,
-      tool_calls: toolCalls,
-    });
-
-    // Executa cada tool e adiciona resultado ao historico
-    for (const call of toolCalls) {
-      const toolName = call.function.name;
-      const toolArgs = call.function.arguments;
-
-      logger.info({ tool: toolName, round }, 'Executing tool call');
-
-      const toolResult = await executeLocalTool(toolName, toolArgs, cwd);
-
-      const record: OllamaToolCallRecord = {
-        tool: toolName,
-        input: toolArgs,
-        output: toolResult.result,
-        isError: toolResult.isError,
-      };
-      toolCallLog.push(record);
-
-      if (onToolUse) {
-        onToolUse(record);
-      }
-
-      const toolMessage: OllamaChatMessage = {
-        role: 'tool',
-        content: toolResult.result,
-      };
-      if (call.id) {
-        toolMessage.tool_call_id = call.id;
-      }
-      messages.push(toolMessage);
-    }
-
-    // Se chegamos ao ultimo round sem resposta final, forca uma ultima chamada sem tools
-    if (round === maxRounds - 1) {
-      logger.warn({ model, maxRounds }, 'Max rounds reached, forcing final response without tools');
-      const finalResponse = await fetchChatNonStreaming(
-        baseUrl,
-        messages,
-        model,
-        undefined,
-        temperature,
-        provider,
-      );
-      finalContent = finalResponse.message?.content ?? '[Limite de rounds atingido sem resposta final]';
-      totalOutputTokens += finalResponse.eval_count ?? 0;
-      totalPromptTokens += finalResponse.prompt_eval_count ?? 0;
-      if (onText && finalContent) {
-        onText(finalContent);
-      }
+  } finally {
+    // Teardown de MCPs (so executa quando mcpServers foi passado)
+    if (mcpClient) {
+      const { teardownMCPsForSession } = await import('./mcp-tool-bridge');
+      await teardownMCPsForSession(mcpClient);
     }
   }
 
@@ -439,6 +864,9 @@ export async function ollamaChatWithTools(
     tokensUsed: totalOutputTokens,
     promptTokens: totalPromptTokens,
     toolCalls: toolCallLog,
+    cacheHitTokens: totalCacheHitTokens > 0 ? totalCacheHitTokens : undefined,
+    reportedCostUsd: totalReportedCostUsd > 0 ? totalReportedCostUsd : undefined,
+    apiRequests: roundCount,
   };
 }
 

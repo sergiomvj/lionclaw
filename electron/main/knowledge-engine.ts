@@ -34,7 +34,7 @@ const logger = createLogger('knowledge-engine');
 
 // ---- Types ----
 
-export type ChunkStrategy = 'recursive' | 'semantic' | 'page' | 'csv' | 'agentic';
+export type ChunkStrategy = 'recursive' | 'semantic' | 'page' | 'csv' | 'agentic' | 'markdown';
 
 export interface RawDocument {
   text: string;
@@ -436,62 +436,6 @@ function chunkByPage(raw: RawDocument): ChunkResult[] {
     }));
 }
 
-function chunkMarkdown(text: string): ChunkResult[] {
-  const lines = text.split('\n');
-  const chunks: ChunkResult[] = [];
-
-  let currentContent: string[] = [];
-  let headingStack: string[] = [];
-  let currentHeadingLevel = 0;
-
-  const flushChunk = (): void => {
-    const content = currentContent.join('\n').trim();
-    if (content.length > 0) {
-      chunks.push({
-        content,
-        metadata: {
-          heading_hierarchy: headingStack.join(' > '),
-        },
-        token_count: 0,
-      });
-    }
-    currentContent = [];
-  };
-
-  for (const line of lines) {
-    const headingMatch = line.match(/^(#{1,4})\s+(.+)$/);
-    if (headingMatch) {
-      const level = headingMatch[1].length;
-      const title = headingMatch[2];
-
-      // Flush current chunk before starting a new section
-      if (currentContent.length > 0) {
-        flushChunk();
-      }
-
-      // Update heading stack
-      if (level <= currentHeadingLevel) {
-        // Pop deeper headings
-        headingStack = headingStack.slice(0, level - 1);
-      }
-      headingStack[level - 1] = `${'#'.repeat(level)} ${title}`;
-      headingStack = headingStack.slice(0, level);
-      currentHeadingLevel = level;
-
-      currentContent.push(line);
-    } else {
-      currentContent.push(line);
-    }
-  }
-
-  if (currentContent.length > 0) {
-    flushChunk();
-  }
-
-  return chunks.length > 0
-    ? chunks
-    : [{ content: text, metadata: { heading_hierarchy: '' }, token_count: 0 }];
-}
 
 function chunkCsv(raw: RawDocument): ChunkResult[] {
   if (!raw.rows || raw.rows.length === 0) {

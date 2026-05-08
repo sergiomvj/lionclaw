@@ -2,7 +2,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import { BrowserWindow } from 'electron';
 import crypto from 'crypto';
 import { getDb, createSession } from './db';
-import { executeQuery } from './orchestrator';
+import { executeBackgroundQuery } from './orchestrator';
 import { getSecret } from './secrets-vault';
 import { updateChannelStatus } from './channels-db';
 import { createLogger } from './logger';
@@ -322,7 +322,7 @@ export function isTelegramConfigured(): boolean {
   return config !== null && config.notifyOnSchedulerTasks;
 }
 
-async function handleBotCommand(text: string, chatId: number, config: TelegramConfig): Promise<void> {
+async function handleBotCommand(text: string, chatId: number, _config: TelegramConfig): Promise<void> {
   if (!bot) return;
 
   const command = text.split(' ')[0].toLowerCase();
@@ -423,7 +423,7 @@ async function executeTelegramQuery(
   ).get(sessionId) as { id: number } | undefined;
   const lastIdBefore = lastBefore?.id ?? 0;
 
-  await executeQuery(contextualMessage, {
+  await executeBackgroundQuery(contextualMessage, {
     sessionId,
     silent: true,
     displayMessage: text,

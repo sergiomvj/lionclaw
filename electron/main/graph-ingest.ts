@@ -1176,7 +1176,6 @@ async function processContent(
  */
 export async function ingestFile(filePath: string, fileName: string): Promise<IngestJob> {
   const jobId = crypto.randomUUID();
-  const now = new Date().toISOString();
 
   // Copy to uploads
   const uploadsDir = getUploadsDir();

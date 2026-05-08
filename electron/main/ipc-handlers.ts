@@ -13,10 +13,7 @@ import {
   deleteScheduledSessions,
   updateSessionStatus,
   getActiveSession,
-  getUsageStats,
-  getSessionTokens,
-  getUsageByAgent,
-  getTaskExecutions,
+  getActiveChatSession,
   getAllAgents,
   getAgent,
   insertAgent,
@@ -33,23 +30,12 @@ import {
   getEnabledTools,
   createSession,
   getSession,
-  insertWorkflowRun,
-  getActiveWorkflowRun,
-  cancelWorkflowRun,
-  completeWorkflowRun,
-  setWorkflowRunGenerating,
-  setWorkflowRunActive,
 } from './db';
-import {
-  executeWorkflowChat,
-  executeSpecGeneration,
-  resetWorkflowSessionState,
-} from './workflow-engine';
-import { handleDiscoveryMessage, resetDiscoverySessionState } from './discovery-harness';
 import { submitMessage, stopCurrentQuery, resetSdkSessionState } from './orchestrator';
+import { spawnCodeburn, writeCodeburn, resizeCodeburn, killCodeburn } from './codeburn-pty';
 import { resolveConfirmation } from './permission-guard';
 import { resolveAskQuestion } from './ask-question';
-import { runCompaction, searchSemanticMemories, archiveConversation } from './memory-pipeline';
+import { runCompaction, searchSemanticMemories } from './memory-pipeline';
 import { listSkills, getSkill, createSkill, updateSkill, updateSkillRaw, deleteSkill } from './skills';
 import type { SkillCreateInput } from './skills';
 import {
@@ -73,7 +59,6 @@ import {
   restartServer,
   startServer,
   stopServer,
-  discoverAndSaveMCPTools,
 } from './mcp-manager';
 import {
   discoverSDKMcpServers,
@@ -91,10 +76,18 @@ import {
   setVaultSecret,
   deleteVaultSecret,
   checkVaultSecret,
+  registerVaultEntry,
+  getSecret,
+  type VaultEntry,
 } from './vault-registry';
+import { PROVIDER_PRESETS } from '../../src/lib/provider-presets';
 import { getAllChannels, getChannel, upsertChannel, toggleChannel } from './channels-db';
 import { startTelegramBot, stopTelegramBot, isTelegramRunning, onTelegramSessionCompacted } from './telegram-bridge';
 import TelegramBot from 'node-telegram-bot-api';
+import { acquireProjectLock, ensureProjectLock, releaseProjectLock } from './pipeline-shared/lock';
+import { setProjectStatus } from './pipeline-shared/status';
+import { withHarnessEngine, withPipelineEngine } from './pipeline-shared/ipc-helpers';
+import { mapPipelineProject } from './pipeline-shared/project-mapper';
 import { loadSoul, saveSoul, loadUser, saveUser } from './prompt-builder';
 import { checkOllamaAvailable } from './ollama-client';
 import {
@@ -150,6 +143,8 @@ import {
   updateHarnessProject,
   getHarnessProject,
   listHarnessProjects,
+  getSecurityAgentStatuses,
+  getAuditAgentsState,
   deleteHarnessProject,
   getHarnessSprints,
   getHarnessRounds,
@@ -166,12 +161,25 @@ import {
   listPipelineMessagesForSprint,
 } from './db';
 import type { HarnessEngine } from './harness-engine';
-import { readLatestSprintsJson } from './harness-planner';
+import { readHarnessSprintsJson } from './harness-planner';
 import type { EnrichSessionRow } from './db';
 import type { EnrichSession } from '../../src/types';
 import type { PipelineEngine } from './pipeline-engine';
-import { getPipelineMetrics } from './db';
+import { SECURITY_CONVERSATION_PHASES, DEV_CONVERSATION_PHASES, ARCHITECTURE_CONVERSATION_PHASES } from './pipeline-engine';
+import { getPipelineMetrics, getSecuritySummaryJson } from './db';
 import { generatePipelineReport, exportReport as exportPipelineReport } from './pipeline-report';
+import {
+  findConsolidatedSecurityReport,
+  findHarnessSprintsReadPath,
+  findPipelineDocReadPath,
+  generatePipelineDocsId,
+  getLegacyHarnessSprintArtifactDir,
+  getPipelineDocsContext,
+  migrateHarnessSprintsToPipelineDocs,
+  resolveHarnessProjectDir,
+  resolveHarnessSprintArtifactDir,
+} from './pipeline-paths';
+import { getArchitectureReviewContext } from './architecture-review-paths';
 
 function mapEnrichSessionRowToApi(row: EnrichSessionRow): EnrichSession {
   return {
@@ -215,26 +223,144 @@ function mapEnrichSessionRowToApi(row: EnrichSessionRow): EnrichSession {
 
 const logger = createLogger('ipc');
 
-interface RebuiltMessage {
-  id: number;
-  role: 'user' | 'assistant';
-  content: string;
-}
+// ---------------------------------------------------------------------------
+// Security pipeline phase artifact readers
+// ---------------------------------------------------------------------------
 
-function rebuildMessagesFromNotes(notesContent: string): RebuiltMessage[] {
-  const messages: RebuiltMessage[] = [];
-  const lines = notesContent.split('\n');
-  let id = 1;
+type SecurityArtifact =
+  | { type: 'markdown'; content: string }
+  | { type: 'sprints'; sprints: ReturnType<typeof getHarnessSprints> };
 
-  for (const line of lines) {
-    const fieldMatch = line.match(/^\*\*(.+?)\*\*:\s*(.+)/);
-    if (fieldMatch && fieldMatch[2] && fieldMatch[2] !== '[pendente - usuario nao definiu]') {
-      messages.push({ id: id++, role: 'assistant', content: `Sobre **${fieldMatch[1]}**:` });
-      messages.push({ id: id++, role: 'user', content: fieldMatch[2] });
+/**
+ * Security pipeline artifact resolver.
+ * Returns null when the phase is not handled by the security branch
+ * (caller falls back to empty content).
+ *
+ * Handled phases:
+ *   1 Repo Profiler   -> manifest.json formatted as markdown
+ *   2 Security Audit  -> latest Security-{scanId}.md consolidated report
+ *   3 Deduplicador    -> latest Security-{scanId}.md (deduplicator overwrites it)
+ *   6 SPEC Generator  -> project.specPath (SPECsecurity-*.md)
+ *   8 Planner         -> harness_sprints list (same shape as dev phase 11)
+ */
+function readSecurityPhaseArtifact(
+  project: { projectPath: string; specPath?: string; id: string; pipelineDocsId?: string | null },
+  phase: number,
+): SecurityArtifact | null {
+  const projectPath = project.projectPath;
+  if (!projectPath) return { type: 'markdown' as const, content: '' };
+
+  if (phase === 1) {
+    const manifestPath = path.join(projectPath, '.lionclaw', 'manifest.json');
+    return { type: 'markdown' as const, content: renderManifestAsMarkdown(manifestPath) };
+  }
+
+  if (phase === 2 || phase === 3) {
+    const reportPath = findConsolidatedSecurityReport(projectPath, project.pipelineDocsId ?? null);
+    if (!reportPath) return { type: 'markdown' as const, content: '' };
+    try {
+      return { type: 'markdown' as const, content: fs.readFileSync(reportPath, 'utf-8') };
+    } catch {
+      return { type: 'markdown' as const, content: '' };
     }
   }
 
-  return messages;
+  if (phase === 6) {
+    const specPath = findPipelineDocReadPath(
+      projectPath,
+      project.pipelineDocsId ?? null,
+      'SPEC.md',
+      'SPEC.md',
+      project.specPath,
+    );
+    if (!specPath) return { type: 'markdown' as const, content: '' };
+    try {
+      return { type: 'markdown' as const, content: fs.readFileSync(specPath, 'utf-8') };
+    } catch {
+      return { type: 'markdown' as const, content: '' };
+    }
+  }
+
+  if (phase === 8) {
+    return { type: 'sprints' as const, sprints: getHarnessSprints(project.id) };
+  }
+
+  return null;
+}
+
+/** Render the repo profiler manifest as a human-readable markdown summary. */
+function renderManifestAsMarkdown(manifestPath: string): string {
+  let raw: string;
+  try {
+    raw = fs.readFileSync(manifestPath, 'utf-8');
+  } catch {
+    return '';
+  }
+
+  let manifest: {
+    language?: string;
+    framework?: string;
+    scannedAt?: string;
+    totalFiles?: number;
+    classifiedFiles?: number;
+    ignoredDirs?: string[];
+    filesByRole?: Record<string, string[]>;
+    previousScan?: string | null;
+  };
+  try {
+    manifest = JSON.parse(raw);
+  } catch {
+    return '';
+  }
+
+  const lines: string[] = [];
+  lines.push('# Repo Profiler');
+  lines.push('');
+
+  const language = manifest.language ?? 'desconhecida';
+  const framework = manifest.framework && manifest.framework !== 'unknown' && manifest.framework !== manifest.language
+    ? ` + ${manifest.framework}`
+    : '';
+  lines.push(`**Stack detectada:** ${language}${framework}`);
+
+  if (manifest.scannedAt) {
+    lines.push(`**Escaneado em:** ${manifest.scannedAt}`);
+  }
+  lines.push('');
+
+  lines.push('## Totais');
+  lines.push(`- Arquivos encontrados: **${manifest.totalFiles ?? 0}**`);
+  lines.push(`- Arquivos classificados: **${manifest.classifiedFiles ?? 0}**`);
+  lines.push('');
+
+  const filesByRole = manifest.filesByRole ?? {};
+  const roleEntries = Object.entries(filesByRole)
+    .map(([role, files]) => ({ role, count: Array.isArray(files) ? files.length : 0 }))
+    .filter((e) => e.count > 0)
+    .sort((a, b) => b.count - a.count);
+
+  if (roleEntries.length > 0) {
+    lines.push('## Classificacao por role');
+    lines.push('');
+    lines.push('| Role | Arquivos |');
+    lines.push('| --- | ---: |');
+    for (const { role, count } of roleEntries) {
+      lines.push(`| ${role} | ${count} |`);
+    }
+    lines.push('');
+  }
+
+  if (Array.isArray(manifest.ignoredDirs) && manifest.ignoredDirs.length > 0) {
+    lines.push(`**Diretorios ignorados:** ${manifest.ignoredDirs.join(', ')}`);
+    lines.push('');
+  }
+
+  if (manifest.previousScan) {
+    lines.push(`**Scan anterior:** \`${path.basename(manifest.previousScan)}\``);
+    lines.push('');
+  }
+
+  return lines.join('\n');
 }
 
 const KB_PROMPT_MARKER = '<!-- kb-agent-id-instruction -->';
@@ -348,90 +474,13 @@ function factoryResetOnboarding(): void {
   logger.info('Factory reset completed - ready for fresh onboarding');
 }
 
-async function createWorkflowRun(getMainWindow: () => BrowserWindow | null): Promise<{ workflowRunId: string; notesPath: string }> {
-  // Cancel any active/generating workflows before creating a new one
-  const existing = getActiveWorkflowRun();
-  if (existing) {
-    cancelWorkflowRun(existing.id);
-    resetWorkflowSessionState();
-    resetDiscoverySessionState();
-    logger.info({ oldRunId: existing.id }, 'Cancelled previous active workflow before creating new one');
-  }
-
-  const runId = crypto.randomUUID();
-  const workflowBaseDir = path.join(getLionClawHome(), 'workflows', 'build-plan');
-  const outputDir = path.join(workflowBaseDir, 'output', runId);
-  fs.mkdirSync(outputDir, { recursive: true });
-
-  const templatePath = path.join(workflowBaseDir, 'discovery-notes.md');
-  const notesPath = path.join(outputDir, 'discovery-notes.md');
-  if (fs.existsSync(templatePath)) {
-    fs.copyFileSync(templatePath, notesPath);
-  }
-
-  insertWorkflowRun({
-    id: runId,
-    workflowId: 'build-plan',
-    sessionId: crypto.randomUUID(),
-    currentStage: 1,
-    notesPath,
-    status: 'active',
-  });
-
-  const win = getMainWindow();
-  if (win && !win.isDestroyed()) {
-    win.webContents.send('workflow:activated', { workflowRunId: runId, notesPath });
-  }
-
-  // Auto-send initial message so the workflow agent starts with Q1
-  const activeRun = getActiveWorkflowRun();
-  if (activeRun) {
-    // Small delay to let renderer mount BuildPlanPage and subscribe to events
-    setTimeout(() => {
-      handleDiscoveryMessage(
-        'Comece o discovery. Faca a primeira pergunta.',
-        activeRun,
-        getMainWindow,
-      ).catch((err) => logger.error({ err }, 'createWorkflowRun: auto-send failed'));
-    }, 500);
-  }
-
-  return { workflowRunId: runId, notesPath };
-}
-
-let workflowUIActive = false;
-
 export function registerIPCHandlers(
   getMainWindow: () => BrowserWindow | null,
   getHarnessEngine: () => HarnessEngine | null = () => null,
   getPipelineEngine: () => PipelineEngine | null = () => null,
 ): void {
-  // Log workflows ativos de sessoes anteriores (NAO cancelar - BuildPlan deve persistir entre restarts)
-  const existingRun = getActiveWorkflowRun();
-  if (existingRun && existingRun.status === 'active') {
-    logger.info({ workflowRunId: existingRun.id }, 'Found active workflow from previous session, preserving for resume');
-  }
-
-  // ---- Workflow UI flag ----
-  ipcMain.handle('workflow:ui-active', (_event, active: boolean) => {
-    workflowUIActive = active;
-  });
-
   // ---- Chat (via Orchestrator) ----
   ipcMain.handle('chat:send', async (_event, message: string, options?: { sessionId?: string; agentId?: string; attachments?: Array<{ id: string; type: string; filename: string; mimeType: string; data: string; size: number }> }) => {
-    // Roteamento: /BuildPlan inicia o workflow
-    if (message.trim() === '/BuildPlan') {
-      return createWorkflowRun(getMainWindow);
-    }
-
-    // Roteamento: se ha workflow ativo E o usuario esta na tela de BuildPlan
-    const activeRun = getActiveWorkflowRun();
-    if (activeRun && activeRun.status === 'active' && workflowUIActive) {
-      // Discovery phase: harness controls the flow
-      handleDiscoveryMessage(message, activeRun, getMainWindow);
-      return;
-    }
-
     // Fluxo normal via submitMessage()
     submitMessage(message, options || {}, getMainWindow);
   });
@@ -476,11 +525,11 @@ export function registerIPCHandlers(
   });
 
   ipcMain.handle('chat:get-active-session', () => {
-    return getActiveSession();
+    return getActiveChatSession();
   });
 
   ipcMain.handle('chat:compact-session', async () => {
-    const activeSession = getActiveSession();
+    const activeSession = getActiveChatSession();
     if (!activeSession) {
       logger.warn('No active session to compact');
       return { success: false, reason: 'no_active_session' };
@@ -522,7 +571,7 @@ export function registerIPCHandlers(
   });
 
   ipcMain.handle('chat:clear-session', async () => {
-    const activeSession = getActiveSession();
+    const activeSession = getActiveChatSession();
     if (!activeSession) {
       logger.warn('No active session to clear');
       return { success: false, reason: 'no_active_session' };
@@ -542,21 +591,23 @@ export function registerIPCHandlers(
     return { success: true, newSessionId };
   });
 
-  // ---- Usage ----
-  ipcMain.handle('usage:get-stats', (_event, filter: { from?: string; to?: string; model?: string }) => {
-    return getUsageStats(filter || {});
+  // ---- Codeburn (TUI embed via node-pty) ----
+  ipcMain.handle('codeburn:spawn', (event, payload: { cols?: number; rows?: number } = {}) => {
+    const window = BrowserWindow.fromWebContents(event.sender);
+    if (!window) return { ok: false, error: 'janela nao encontrada' };
+    return spawnCodeburn(window, payload.cols ?? 120, payload.rows ?? 30);
   });
 
-  ipcMain.handle('usage:get-session-stats', (_event, sessionId: string) => {
-    return getSessionTokens(sessionId);
+  ipcMain.handle('codeburn:write', (event, data: string) => {
+    writeCodeburn(event.sender.id, data);
   });
 
-  ipcMain.handle('usage:get-agent-stats', (_event, filter: { from?: string; to?: string }) => {
-    return getUsageByAgent(filter || {});
+  ipcMain.handle('codeburn:resize', (event, payload: { cols: number; rows: number }) => {
+    resizeCodeburn(event.sender.id, payload.cols, payload.rows);
   });
 
-  ipcMain.handle('usage:get-task-executions', (_event, filter: { sessionId?: string; agentId?: string; from?: string; to?: string }) => {
-    return getTaskExecutions(filter || {});
+  ipcMain.handle('codeburn:kill', (event) => {
+    killCodeburn(event.sender.id);
   });
 
   // ---- Agents ----
@@ -661,10 +712,6 @@ export function registerIPCHandlers(
 
   ipcMain.handle('mcp:toggle-sdk', (_event, serverName: string, enabled: boolean) => {
     setSDKMcpDisabled(serverName, !enabled);
-  });
-
-  ipcMain.handle('mcp:discover-tools', async (_event, serverId: string) => {
-    return discoverAndSaveMCPTools(serverId);
   });
 
   // ---- Scheduler ----
@@ -790,7 +837,7 @@ export function registerIPCHandlers(
 
   ipcMain.handle('memory:trigger-compaction', async () => {
     // Deprecated - uses active session dates instead of arbitrary 24h window
-    const activeSession = getActiveSession();
+    const activeSession = getActiveChatSession();
     if (!activeSession) return;
 
     await runCompaction(new Date(activeSession.createdAt), new Date(), activeSession.id);
@@ -800,23 +847,22 @@ export function registerIPCHandlers(
     createSession(newSessionId, '');
   });
 
-  ipcMain.handle('memory:archive-conversation', async (_event, sessionId: string) => {
-    return archiveConversation(sessionId);
-  });
-
   // ---- Tools ----
-  ipcMain.handle('tools:getSettings', () => {
-    return getToolSettings();
-  });
-
-  ipcMain.handle('tools:setEnabled', (_e, tool: string, enabled: boolean) => {
+  // S7.3: novos canais em kebab-case + aliases retrocompatives.
+  // Alias DEPRECATED — remover em vNext apos confirmar zero consumers.
+  const toolsGetSettings = () => getToolSettings();
+  const toolsSetEnabled = (_e: unknown, tool: string, enabled: boolean) => {
     setToolEnabled(tool, enabled);
     return getToolSettings();
-  });
+  };
+  const toolsGetEnabled = () => getEnabledTools();
 
-  ipcMain.handle('tools:getEnabled', () => {
-    return getEnabledTools();
-  });
+  ipcMain.handle('tools:get-settings', toolsGetSettings);
+  ipcMain.handle('tools:getSettings', toolsGetSettings); // DEPRECATED — remove in vNext
+  ipcMain.handle('tools:set-enabled', toolsSetEnabled);
+  ipcMain.handle('tools:setEnabled', toolsSetEnabled); // DEPRECATED — remove in vNext
+  ipcMain.handle('tools:get-enabled', toolsGetEnabled);
+  ipcMain.handle('tools:getEnabled', toolsGetEnabled); // DEPRECATED — remove in vNext
 
   // ---- Settings ----
   ipcMain.handle('settings:get', async (): Promise<AppSettings> => {
@@ -988,6 +1034,21 @@ export function registerIPCHandlers(
     return checkVaultSecret(key);
   });
 
+  ipcMain.handle('vault:register-and-set', async (
+    _event,
+    entry: Omit<VaultEntry, 'configured'>,
+    value: string,
+  ) => {
+    try {
+      registerVaultEntry(entry);
+      await setVaultSecret(entry.key, value);
+      return { ok: true };
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      return { error: message };
+    }
+  });
+
   // ---- Image ----
   ipcMain.handle('image:generate', async (_event, prompt: string, options?: { aspectRatio?: string }) => {
     return generateImage(prompt, options as { aspectRatio?: '1:1' | '3:4' | '4:3' | '9:16' | '16:9' });
@@ -1009,13 +1070,13 @@ export function registerIPCHandlers(
 
   ipcMain.handle('voice:list-voices', async () => {
     const apiKey = await (await import('./secrets-vault')).getSecret('ELEVENLABS_API_KEY');
-    if (!apiKey) throw new Error('ELEVENLABS_API_KEY nao configurada');
+    if (!apiKey) return { error: 'ELEVENLABS_API_KEY nao configurada' };
 
     const response = await fetch('https://api.elevenlabs.io/v1/voices', {
       headers: { 'xi-api-key': apiKey },
     });
 
-    if (!response.ok) throw new Error(`ElevenLabs failed: ${response.status}`);
+    if (!response.ok) return { error: `ElevenLabs failed: ${response.status}` };
 
     const data = await response.json() as { voices: Array<{ voice_id: string; name: string; category: string; labels: Record<string, string>; preview_url: string }> };
     return data.voices.map(v => ({
@@ -1135,11 +1196,23 @@ export function registerIPCHandlers(
   });
 
   // ---- Local LLM (Ollama / LM Studio / OpenAI-compatible) ----
-  ipcMain.handle('ollama:check', async (_event, baseUrl: string, model: string, provider?: string) => {
-    return checkOllamaAvailable(baseUrl, model, (provider as 'ollama' | 'lmstudio' | 'openai-compatible') || 'ollama');
+  ipcMain.handle('ollama:check', async (
+    _event,
+    baseUrl: string,
+    model: string,
+    provider?: string,
+    authHeaders?: Record<string, string>,
+  ) => {
+    return checkOllamaAvailable(baseUrl, model, (provider as 'ollama' | 'lmstudio' | 'openai-compatible') || 'ollama', authHeaders);
   });
 
-  ipcMain.handle('ollama:listModels', async (_event, provider: string, baseUrl: string) => {
+  // S7.3: novo canal em kebab-case + alias retrocompatible.
+  const ollamaListModels = async (
+    _event: unknown,
+    provider: string,
+    baseUrl: string,
+    authHeaders?: Record<string, string>,
+  ) => {
     try {
       if (provider === 'ollama') {
         const res = await fetch(`${baseUrl}/api/tags`, { method: 'GET', signal: AbortSignal.timeout(15000) });
@@ -1147,13 +1220,73 @@ export function registerIPCHandlers(
         const json = (await res.json()) as { models?: Array<{ name: string }> };
         return { models: (json.models || []).map((m) => m.name) };
       } else {
-        const res = await fetch(`${baseUrl}/v1/models`, { method: 'GET', signal: AbortSignal.timeout(15000) });
+        const res = await fetch(`${baseUrl}/v1/models`, {
+          method: 'GET',
+          signal: AbortSignal.timeout(15000),
+          headers: { ...authHeaders },
+        });
         if (!res.ok) return { models: [], error: `HTTP ${res.status}` };
         const json = (await res.json()) as { data?: Array<{ id: string }> };
         return { models: (json.data || []).map((m) => m.id) };
       }
     } catch (err) {
       return { models: [], error: err instanceof Error ? err.message : 'Erro desconhecido' };
+    }
+  };
+  ipcMain.handle('ollama:list-models', ollamaListModels);
+  ipcMain.handle('ollama:listModels', ollamaListModels); // DEPRECATED — remove in vNext
+
+  ipcMain.handle('provider:test-connection', async (
+    _event,
+    providerName: string,
+    baseUrl: string,
+    apiKeyRef: string,
+  ) => {
+    try {
+      const apiKey = await getSecret(apiKeyRef);
+      if (!apiKey) return { ok: false, error: 'API key nao configurada no Vault.' };
+
+      const preset = PROVIDER_PRESETS[providerName];
+
+      const headers: Record<string, string> = {
+        ...(preset?.extraHeaders ?? {}),
+        'Authorization': `Bearer ${apiKey}`,
+      };
+
+      if (preset?.testEndpoint) {
+        const testUrl = `${baseUrl}${preset.testEndpoint}`;
+        const res = await fetch(testUrl, {
+          method: 'GET',
+          headers,
+          signal: AbortSignal.timeout(15000),
+        });
+        if (!res.ok) {
+          return { ok: false, error: `HTTP ${res.status}: Key invalida ou expirada.` };
+        }
+        return { ok: true };
+      }
+
+      // Fallback: hit the models endpoint. baseUrl already includes /v1 for known
+      // providers, so concatenate just the modelsEndpoint (default '/models').
+      // Concatenating '/v1/models' here causes a double-/v1/ for providers like
+      // OpenAI whose baseUrl is already https://api.openai.com/v1.
+      const modelsEndpoint = preset?.modelsEndpoint ?? '/models';
+      const res = await fetch(`${baseUrl}${modelsEndpoint}`, {
+        method: 'GET',
+        headers,
+        signal: AbortSignal.timeout(15000),
+      });
+
+      if (res.status === 401 || res.status === 403) {
+        return { ok: false, error: `HTTP ${res.status}: Key invalida ou sem permissao.` };
+      }
+      if (!res.ok) {
+        return { ok: false, error: `HTTP ${res.status}` };
+      }
+
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : 'Erro desconhecido' };
     }
   });
 
@@ -1338,20 +1471,20 @@ export function registerIPCHandlers(
   }) => {
     // Validate project path exists before creating
     if (!fs.existsSync(data.projectPath)) {
-      throw new Error(`Caminho do projeto nao existe: ${data.projectPath}. Crie o diretorio primeiro.`);
+      return { error: `Caminho do projeto nao existe: ${data.projectPath}. Crie o diretorio primeiro.` };
     }
 
     // Resolve spec content: from file path or inline text
     let specContent: string;
     if (data.specFilePath) {
       if (!fs.existsSync(data.specFilePath)) {
-        throw new Error(`Arquivo da SPEC nao encontrado: ${data.specFilePath}`);
+        return { error: `Arquivo da SPEC nao encontrado: ${data.specFilePath}` };
       }
       specContent = fs.readFileSync(data.specFilePath, 'utf-8');
     } else if (data.specText) {
       specContent = data.specText;
     } else {
-      throw new Error('Informe o caminho do arquivo da SPEC ou o conteudo da SPEC.');
+      return { error: 'Informe o caminho do arquivo da SPEC ou o conteudo da SPEC.' };
     }
 
     const project = insertHarnessProject({
@@ -1362,8 +1495,7 @@ export function registerIPCHandlers(
       config: data.config,
     });
 
-    const projectDir = path.join(getLionClawPath(), 'harness', 'projects', project.id);
-    fs.mkdirSync(projectDir, { recursive: true });
+    const projectDir = resolveHarnessProjectDir(project);
     const specPath = path.join(projectDir, 'spec.md');
     fs.writeFileSync(specPath, specContent, 'utf-8');
 
@@ -1373,55 +1505,50 @@ export function registerIPCHandlers(
   });
 
   ipcMain.handle('harness:plan', (_event, projectId: string) => {
-    const engine = getHarnessEngine();
-    if (!engine) throw new Error('HarnessEngine not initialized');
-    engine.plan(projectId).catch(err => {
-      logger.error({ err, projectId }, 'Plan failed');
+    return withHarnessEngine(getHarnessEngine, (engine) => {
+      engine.plan(projectId).catch(err => {
+        logger.error({ err, projectId }, 'Plan failed');
+      });
     });
   });
 
   ipcMain.handle('harness:approve-sprints', (_event, projectId: string) => {
-    updateHarnessProject(projectId, { status: 'ready' });
+    // F5: status puro vai por setProjectStatus (emit IPC + tipo seguro).
+    setProjectStatus(projectId, 'ready');
     // Automatically start execution after approval
-    const engine = getHarnessEngine();
-    if (!engine) throw new Error('HarnessEngine not initialized');
-    engine.run(projectId).catch(err => {
-      logger.error({ err, projectId }, 'Run after approval failed');
+    return withHarnessEngine(getHarnessEngine, (engine) => {
+      engine.run(projectId).catch(err => {
+        logger.error({ err, projectId }, 'Run after approval failed');
+      });
     });
   });
 
   ipcMain.handle('harness:regenerate-sprints', (_event, projectId: string, feedback: string) => {
-    const engine = getHarnessEngine();
-    if (!engine) throw new Error('HarnessEngine not initialized');
-    engine.regenerate(projectId, feedback).catch(err => {
-      logger.error({ err, projectId }, 'Regenerate failed');
+    return withHarnessEngine(getHarnessEngine, (engine) => {
+      engine.regenerate(projectId, feedback).catch(err => {
+        logger.error({ err, projectId }, 'Regenerate failed');
+      });
     });
   });
 
   ipcMain.handle('harness:run', (_event, projectId: string) => {
-    const engine = getHarnessEngine();
-    if (!engine) throw new Error('HarnessEngine not initialized');
-    engine.run(projectId).catch(err => {
-      logger.error({ err, projectId }, 'Run failed');
+    return withHarnessEngine(getHarnessEngine, (engine) => {
+      engine.run(projectId).catch(err => {
+        logger.error({ err, projectId }, 'Run failed');
+      });
     });
   });
 
   ipcMain.handle('harness:pause', (_event, projectId: string) => {
-    const engine = getHarnessEngine();
-    if (!engine) throw new Error('HarnessEngine not initialized');
-    engine.pause(projectId);
+    return withHarnessEngine(getHarnessEngine, (engine) => { engine.pause(projectId); });
   });
 
   ipcMain.handle('harness:resume', (_event, projectId: string) => {
-    const engine = getHarnessEngine();
-    if (!engine) throw new Error('HarnessEngine not initialized');
-    engine.resume(projectId);
+    return withHarnessEngine(getHarnessEngine, (engine) => { engine.resume(projectId); });
   });
 
   ipcMain.handle('harness:abort', (_event, projectId: string) => {
-    const engine = getHarnessEngine();
-    if (!engine) throw new Error('HarnessEngine not initialized');
-    engine.abort(projectId);
+    return withHarnessEngine(getHarnessEngine, (engine) => { engine.abort(projectId); });
   });
 
   ipcMain.handle('harness:delete-project', (_event, projectId: string) => {
@@ -1430,13 +1557,8 @@ export function registerIPCHandlers(
     if (engine) {
       try { engine.abort(projectId); } catch { /* not running, that's fine */ }
     }
-    // Delete from DB (rounds, sprints, project)
+    // Delete from DB (rounds, sprints, project). Project-owned docs/artifacts are left in place.
     deleteHarnessProject(projectId);
-    // Delete filesystem artifacts
-    const projectDir = path.join(getLionClawPath(), 'harness', 'projects', projectId);
-    if (fs.existsSync(projectDir)) {
-      fs.rmSync(projectDir, { recursive: true, force: true });
-    }
     logger.info({ projectId }, 'Harness project deleted via IPC');
   });
 
@@ -1457,11 +1579,15 @@ export function registerIPCHandlers(
   });
 
   ipcMain.handle('harness:get-evaluation', (_event, projectId: string, sprintId: string) => {
-    const evalPath = path.join(
-      getLionClawPath(), 'harness', 'projects', projectId, 'sprints', sprintId, 'evaluation.json'
-    );
+    const project = getHarnessProject(projectId);
+    if (!project) return null;
+    const evalPath = path.join(resolveHarnessSprintArtifactDir(project, sprintId), 'evaluation.json');
+    const legacyEvalPath = path.join(getLegacyHarnessSprintArtifactDir(projectId, sprintId), 'evaluation.json');
+    // Read-only compatibility fallback for evaluations written before Sprint 1.
+    // New evaluation writes stay under resolveHarnessSprintArtifactDir(project, ...).
+    const resolvedPath = fs.existsSync(evalPath) ? evalPath : legacyEvalPath;
     try {
-      const content = fs.readFileSync(evalPath, 'utf-8');
+      const content = fs.readFileSync(resolvedPath, 'utf-8');
       return JSON.parse(content);
     } catch {
       return null;
@@ -1469,16 +1595,18 @@ export function registerIPCHandlers(
   });
 
   ipcMain.handle('harness:get-sprint-json', (_event, projectId: string, sprintJsonId: string) => {
-    const projectDir = path.join(getLionClawPath(), 'harness', 'projects', projectId);
-    const sprintsJson = readLatestSprintsJson(projectDir);
+    const project = getHarnessProject(projectId);
+    if (!project) return null;
+    const sprintsJson = readHarnessSprintsJson(project);
     if (!sprintsJson) return null;
     const sprint = sprintsJson.sprints.find((s: { id: string }) => s.id === sprintJsonId);
     return sprint ?? null;
   });
 
   ipcMain.handle('harness:get-sprints-json', (_event, projectId: string) => {
-    const projectDir = path.join(getLionClawPath(), 'harness', 'projects', projectId);
-    return readLatestSprintsJson(projectDir);
+    const project = getHarnessProject(projectId);
+    if (!project) return null;
+    return readHarnessSprintsJson(project);
   });
 
   ipcMain.handle('harness:get-metrics', (_event, projectId: string) => {
@@ -1492,11 +1620,16 @@ export function registerIPCHandlers(
   });
 
   ipcMain.handle('harness:get-feedback-audit', (_event, projectId: string, sprintId: string) => {
-    const projectDir = path.join(getLionClawPath(), 'harness', 'projects', projectId, 'sprints', sprintId);
-    const filePath = path.join(projectDir, 'feedback-audit.jsonl');
-    if (!fs.existsSync(filePath)) return [];
+    const project = getHarnessProject(projectId);
+    if (!project) return [];
+    const filePath = path.join(resolveHarnessSprintArtifactDir(project, sprintId), 'feedback-audit.jsonl');
+    const legacyFilePath = path.join(getLegacyHarnessSprintArtifactDir(projectId, sprintId), 'feedback-audit.jsonl');
+    // Read-only compatibility fallback for audits written before Sprint 1.
+    // New feedback audit writes stay under resolveHarnessSprintArtifactDir(project, ...).
+    const resolvedPath = fs.existsSync(filePath) ? filePath : legacyFilePath;
+    if (!fs.existsSync(resolvedPath)) return [];
     try {
-      return fs.readFileSync(filePath, 'utf-8')
+      return fs.readFileSync(resolvedPath, 'utf-8')
         .split('\n')
         .filter(line => line.trim())
         .map(line => JSON.parse(line));
@@ -1505,88 +1638,29 @@ export function registerIPCHandlers(
     }
   });
 
-  // ---- Workflow (BuildPlan) ----
-
-  ipcMain.handle('workflow:start', async () => {
-    return createWorkflowRun(getMainWindow);
-  });
-
-  ipcMain.handle('workflow:approve', async (_event, workflowRunId: string) => {
-    const run = getActiveWorkflowRun();
-    if (!run || run.id !== workflowRunId) {
-      throw new Error(`Workflow run ${workflowRunId} not found or not active`);
-    }
-    setWorkflowRunGenerating(workflowRunId);
-    // Fire-and-forget: retorna imediatamente para o renderer montar o
-    // SpecGenerationView ANTES dos eventos de streaming comecarem.
-    // Sem isso, o await segura o IPC invoke ate a geracao terminar,
-    // e o componente so monta depois que todos os eventos ja foram emitidos.
-    executeSpecGeneration(run, getMainWindow)
-      .then(() => completeWorkflowRun(workflowRunId))
-      .catch((err) => {
-        logger.error({ err, workflowRunId }, 'executeSpecGeneration failed');
-        setWorkflowRunActive(workflowRunId);
-        const win = getMainWindow();
-        if (win && !win.isDestroyed()) {
-          win.webContents.send('workflow:agent-stream', {
-            agent: 'spec-builder',
-            msg: { type: 'error', content: (err as Error).message },
-          });
-        }
-      });
-  });
-
-  ipcMain.handle('workflow:cancel', async (_event, workflowRunId: string) => {
-    cancelWorkflowRun(workflowRunId);
-    resetWorkflowSessionState();
-    resetDiscoverySessionState();
-  });
-
-  ipcMain.handle('workflow:get-active', async () => {
-    const activeRun = getActiveWorkflowRun();
-    if (!activeRun) return null;
-
-    let notesContent = '';
-    if (activeRun.notesPath) {
-      try {
-        notesContent = fs.readFileSync(activeRun.notesPath, 'utf-8');
-      } catch { /* arquivo pode nao existir ainda */ }
-    }
-
-    const messages = rebuildMessagesFromNotes(notesContent);
-
-    return {
-      workflowRunId: activeRun.id,
-      currentStage: activeRun.currentStage,
-      currentQuestion: activeRun.currentQuestion ?? 'Q1',
-      notesPath: activeRun.notesPath,
-      status: activeRun.status,
-      notesContent,
-      messages,
-    };
-  });
-
   // ---- Shell (Finder integration) ----
 
   ipcMain.handle('shell:show-in-folder', async (_event, filePath: string) => {
     const resolved = path.resolve(filePath);
     const lionclawDir = getLionClawPath();
     if (!resolved.startsWith(path.resolve(lionclawDir))) {
-      throw new Error('Path fora do diretorio permitido');
+      return { error: 'Path fora do diretorio permitido' };
     }
     if (!fs.existsSync(resolved)) {
-      throw new Error('Arquivo nao encontrado');
+      return { error: 'Arquivo nao encontrado' };
     }
     shell.showItemInFolder(resolved);
+    return { ok: true as const };
   });
 
   ipcMain.handle('shell:open-path', async (_event, dirPath: string) => {
     const resolved = path.resolve(dirPath);
     const lionclawDir = getLionClawPath();
     if (!resolved.startsWith(path.resolve(lionclawDir))) {
-      throw new Error('Path fora do diretorio permitido');
+      return { error: 'Path fora do diretorio permitido' };
     }
     await shell.openPath(resolved);
+    return { ok: true as const };
   });
 
   // ---- Dialog (native file/folder pickers) ----
@@ -1856,10 +1930,15 @@ export function registerIPCHandlers(
     return getEnrichMessages(args.sessionId, args.phase);
   });
 
-  // ---- Memory Graph (conditional) ----
-  if (getSetting('mgraph_mode') === 'true') {
+  // ---- Memory Graph ----
+  // S7.4: handlers sempre registrados, check de flag interno em cada um.
+  // Antes eram condicionalmente registrados, o que retornava
+  // "channel not registered" generico no renderer quando flag desabilitada.
+  const mgraphDisabled = () => ({ error: 'mgraph desabilitado nesta build' as const });
+  const isMgraphEnabled = () => getSetting('mgraph_mode') === 'true';
 
     ipcMain.handle('mgraph:graph', () => {
+      if (!isMgraphEnabled()) return mgraphDisabled();
       try {
         return buildGraphData();
       } catch (err) {
@@ -1869,6 +1948,7 @@ export function registerIPCHandlers(
     });
 
     ipcMain.handle('mgraph:read', (_event, notePath: string) => {
+      if (!isMgraphEnabled()) return mgraphDisabled();
       try {
         return readVaultNote(notePath);
       } catch (err) {
@@ -1877,6 +1957,7 @@ export function registerIPCHandlers(
     });
 
     ipcMain.handle('mgraph:search', (_event, query: string) => {
+      if (!isMgraphEnabled()) return mgraphDisabled();
       try {
         return searchVault(query);
       } catch (err) {
@@ -1886,6 +1967,7 @@ export function registerIPCHandlers(
     });
 
     ipcMain.handle('mgraph:seed', async (_event, forceReseed?: boolean) => {
+      if (!isMgraphEnabled()) return mgraphDisabled();
       const win = getMainWindow();
       try {
         const result = await seedVault(win, forceReseed === true);
@@ -1903,6 +1985,7 @@ export function registerIPCHandlers(
     });
 
     ipcMain.handle('mgraph:stats', () => {
+      if (!isMgraphEnabled()) return mgraphDisabled();
       try {
         return getVaultStats();
       } catch (err) {
@@ -1912,6 +1995,7 @@ export function registerIPCHandlers(
     });
 
     ipcMain.handle('mgraph:list-notes', (_event, type: string) => {
+      if (!isMgraphEnabled()) return mgraphDisabled();
       try {
         return listNotesByType(type);
       } catch (err) {
@@ -1921,6 +2005,7 @@ export function registerIPCHandlers(
     });
 
     ipcMain.handle('mgraph:delete-note', (_event, notePath: string, options?: { force?: boolean }) => {
+      if (!isMgraphEnabled()) return mgraphDisabled();
       try {
         return deleteVaultNote(notePath, options);
       } catch (err) {
@@ -1930,6 +2015,7 @@ export function registerIPCHandlers(
     });
 
     ipcMain.handle('mgraph:note-backlinks', (_event, notePath: string) => {
+      if (!isMgraphEnabled()) return mgraphDisabled();
       try {
         return findBacklinks(notePath);
       } catch (err) {
@@ -1941,42 +2027,47 @@ export function registerIPCHandlers(
     // ---- Ingest ----
 
     ipcMain.handle('mgraph:ingest-file', async (_event, filePath: string, fileName: string) => {
+      if (!isMgraphEnabled()) return mgraphDisabled();
       try {
         return await ingestFile(filePath, fileName);
       } catch (err) {
         logger.error({ err }, 'mgraph:ingest-file failed');
-        throw err;
+        return { error: err instanceof Error ? err.message : String(err) };
       }
     });
 
     ipcMain.handle('mgraph:ingest-url', async (_event, url: string) => {
+      if (!isMgraphEnabled()) return mgraphDisabled();
       try {
         return await ingestUrl(url);
       } catch (err) {
         logger.error({ err }, 'mgraph:ingest-url failed');
-        throw err;
+        return { error: err instanceof Error ? err.message : String(err) };
       }
     });
 
     ipcMain.handle('mgraph:ingest-text', async (_event, text: string, title?: string) => {
+      if (!isMgraphEnabled()) return mgraphDisabled();
       try {
         return await ingestText(text, title);
       } catch (err) {
         logger.error({ err }, 'mgraph:ingest-text failed');
-        throw err;
+        return { error: err instanceof Error ? err.message : String(err) };
       }
     });
 
     ipcMain.handle('mgraph:ingest-resume', async (_event, jobId: string) => {
+      if (!isMgraphEnabled()) return mgraphDisabled();
       try {
         return await resumeIngestJob(jobId);
       } catch (err) {
         logger.error({ err }, 'mgraph:ingest-resume failed');
-        throw err;
+        return { error: err instanceof Error ? err.message : String(err) };
       }
     });
 
     ipcMain.handle('mgraph:ingest-history', () => {
+      if (!isMgraphEnabled()) return [];
       try {
         return getIngestHistory();
       } catch (err) {
@@ -1986,37 +2077,45 @@ export function registerIPCHandlers(
     });
 
     ipcMain.handle('mgraph:ingest-cancel', (_event, jobId: string) => {
+      if (!isMgraphEnabled()) return mgraphDisabled();
       cancelIngest(jobId);
+      return { ok: true as const };
     });
 
     ipcMain.handle('mgraph:ingest-estimate', async (_event, filePath: string) => {
+      if (!isMgraphEnabled()) return mgraphDisabled();
       try {
         return await estimateIngestFile(filePath);
       } catch (err) {
         logger.error({ err }, 'mgraph:ingest-estimate failed');
-        throw err;
+        return { error: err instanceof Error ? err.message : String(err) };
       }
     });
 
     ipcMain.handle('mgraph:ingest-discard', (_event, jobId: string) => {
+      if (!isMgraphEnabled()) return mgraphDisabled();
       try {
         discardPartialJob(jobId);
+        return { ok: true as const };
       } catch (err) {
         logger.error({ err }, 'mgraph:ingest-discard failed');
-        throw err;
+        return { error: err instanceof Error ? err.message : String(err) };
       }
     });
 
     ipcMain.handle('mgraph:ingest-accept', (_event, jobId: string) => {
+      if (!isMgraphEnabled()) return mgraphDisabled();
       try {
         acceptPartialJob(jobId);
+        return { ok: true as const };
       } catch (err) {
         logger.error({ err }, 'mgraph:ingest-accept failed');
-        throw err;
+        return { error: err instanceof Error ? err.message : String(err) };
       }
     });
 
     ipcMain.handle('mgraph:ingest-settings', () => {
+      if (!isMgraphEnabled()) return mgraphDisabled();
       return {
         visionModel: (getSetting('ingest_vision_model') as string) || 'claude-sonnet-4-6',
         extractionModel: (getSetting('ingest_extraction_model') as string) || 'claude-sonnet-4-6',
@@ -2030,101 +2129,129 @@ export function registerIPCHandlers(
     });
 
     ipcMain.handle('mgraph:ingest-settings-update', (_event, settings: Record<string, string>) => {
+      if (!isMgraphEnabled()) return mgraphDisabled();
       for (const [key, value] of Object.entries(settings)) {
         const settingKey = `ingest_${key.replace(/[A-Z]/g, (c) => '_' + c.toLowerCase())}`;
         setSetting(settingKey, String(value));
       }
+      return { ok: true as const };
     });
 
-    // Ensure vault structure exists
-    createVaultStructure();
-    logger.info('Memory Graph handlers registered');
-  }
+    // Ensure vault structure exists if mgraph is enabled (one-time bootstrap).
+    if (isMgraphEnabled()) {
+      createVaultStructure();
+      logger.info('Memory Graph handlers registered (enabled)');
+    } else {
+      logger.info('Memory Graph handlers registered (disabled — handlers return error)');
+    }
 
   // ---- Pipeline ----
 
   ipcMain.handle('pipeline:start', async (_event, projectId: string, startPhase: number) => {
     const engine = getPipelineEngine();
     if (!engine) return { error: 'PipelineEngine nao inicializado' };
+    // S4.1: lock estrito per-projeto. Falha imediata se ja existe pipeline rodando
+    // neste projeto (R7/D4 da SPEC). Cross-project continua livre.
+    const lockResult = acquireProjectLock(projectId, 'pipeline-engine');
+    if (!lockResult.ok) {
+      logger.warn(
+        { projectId, runningSince: lockResult.runningPipeline.acquiredAt },
+        'pipeline:start blocked — pipeline ja rodando neste projeto',
+      );
+      return { error: 'Pipeline ja rodando neste projeto' };
+    }
     try {
-      await engine.startPipeline(projectId, startPhase);
+      const result = await engine.startPipeline(projectId, startPhase);
+      // startPipeline pode retornar {error} sem lançar quando ja existe pipeline
+      // rodando ou pre-condicao falha. Liberar lock e propagar.
+      if (result && typeof result === 'object' && 'error' in result) {
+        releaseProjectLock(projectId);
+        logger.warn({ projectId, error: result.error }, 'pipeline:start returned error');
+        return { error: result.error };
+      }
       return { ok: true as const };
     } catch (err) {
+      // Liberar o lock que acabamos de adquirir — startPipeline falhou antes de
+      // criar pipeline vivo, ninguem mais sabe que o lock existe.
+      releaseProjectLock(projectId);
       logger.error({ err, projectId }, 'pipeline:start failed');
       return { error: (err as Error).message };
     }
   });
 
   ipcMain.handle('pipeline:advance', async (_event, projectId: string) => {
+    // S4.1: ensureProjectLock e idempotente — readquire o lock pos-restart caso
+    // o user clique Advance depois de recoverInterruptedPipelines.
     const engine = getPipelineEngine();
     if (!engine) return { error: 'PipelineEngine nao inicializado' };
-    try {
-      await engine.advancePhase(projectId);
+    ensureProjectLock(projectId, 'pipeline-engine');
+    return withPipelineEngine(getPipelineEngine, async (e) => {
+      await e.advancePhase(projectId);
       return { ok: true as const };
-    } catch (err) {
-      logger.error({ err, projectId }, 'pipeline:advance failed');
-      return { error: (err as Error).message };
-    }
+    });
   });
 
   ipcMain.handle('pipeline:abort', (_event, projectId: string) => {
-    const engine = getPipelineEngine();
-    if (!engine) return { error: 'PipelineEngine nao inicializado' };
-    try {
-      engine.abortPipeline(projectId);
+    return withPipelineEngine(getPipelineEngine, (e) => {
+      e.abortPipeline(projectId);
       return { ok: true as const };
-    } catch (err) {
-      logger.error({ err, projectId }, 'pipeline:abort failed');
-      return { error: (err as Error).message };
-    }
+    });
   });
 
   ipcMain.handle('pipeline:pause', (_event, projectId: string) => {
-    const engine = getPipelineEngine();
-    if (!engine) return { error: 'PipelineEngine nao inicializado' };
-    try {
-      engine.pausePipeline(projectId);
+    return withPipelineEngine(getPipelineEngine, (e) => {
+      e.pausePipeline(projectId);
       return { ok: true as const };
-    } catch (err) {
-      logger.error({ err, projectId }, 'pipeline:pause failed');
-      return { error: (err as Error).message };
-    }
+    });
   });
 
   ipcMain.handle('pipeline:resume', async (_event, projectId: string) => {
     const engine = getPipelineEngine();
     if (!engine) return { error: 'PipelineEngine nao inicializado' };
-    try {
-      await engine.resumePipeline(projectId);
+    // S4.1: idempotente — readquire lock pos-restart se necessario.
+    ensureProjectLock(projectId, 'pipeline-engine');
+    return withPipelineEngine(getPipelineEngine, async (e) => {
+      await e.resumePipeline(projectId);
       return { ok: true as const };
-    } catch (err) {
-      logger.error({ err, projectId }, 'pipeline:resume failed');
-      return { error: (err as Error).message };
-    }
+    });
   });
 
   ipcMain.handle('pipeline:send', async (_event, projectId: string, message: string, attachments?: Array<{ id: string; type: string; filename: string; mimeType: string; data: string; size: number }>) => {
-    const engine = getPipelineEngine();
-    if (!engine) return { error: 'PipelineEngine nao inicializado' };
-    try {
-      await engine.sendMessage(projectId, message, attachments);
+    // S4.1: ensureProjectLock idempotente — garante lock readquirido pos-restart.
+    ensureProjectLock(projectId, 'pipeline-engine');
+    return withPipelineEngine(getPipelineEngine, async (e) => {
+      await e.sendMessage(projectId, message, attachments);
       return { ok: true as const };
+    });
+  });
+
+  ipcMain.handle('pipeline:resume-after-auth', async (_event, projectId: string) => {
+    const engine = getPipelineEngine();
+    if (!engine) return { ok: false, message: 'PipelineEngine nao inicializado' };
+    // S4.1: idempotente — readquire lock pos-restart se necessario.
+    ensureProjectLock(projectId, 'pipeline-engine');
+    try {
+      return await engine.resumeAfterAuth(projectId);
     } catch (err) {
-      logger.error({ err, projectId }, 'pipeline:send failed');
-      return { error: (err as Error).message };
+      logger.error({ err, projectId }, 'pipeline:resume-after-auth failed');
+      return { ok: false, message: (err as Error).message };
     }
   });
 
+  ipcMain.handle('pipeline:get-conversation-phases', () => {
+    return {
+      security: Array.from(SECURITY_CONVERSATION_PHASES),
+      dev: Array.from(DEV_CONVERSATION_PHASES),
+      architecture: Array.from(ARCHITECTURE_CONVERSATION_PHASES),
+    };
+  });
+
   ipcMain.handle('pipeline:approve', async (_event, projectId: string, metadata?: Record<string, unknown>) => {
-    const engine = getPipelineEngine();
-    if (!engine) return { error: 'PipelineEngine nao inicializado' };
-    try {
-      await engine.approvePhase(projectId, metadata);
+    ensureProjectLock(projectId, 'pipeline-engine');
+    return withPipelineEngine(getPipelineEngine, async (e) => {
+      await e.approvePhase(projectId, metadata);
       return { ok: true as const };
-    } catch (err) {
-      logger.error({ err, projectId }, 'pipeline:approve failed');
-      return { error: (err as Error).message };
-    }
+    });
   });
 
 
@@ -2156,69 +2283,100 @@ export function registerIPCHandlers(
     }
   });
 
-  ipcMain.handle('pipeline:accept-sprint', async (_event, projectId: string, sprintIndex: number) => {
-    const engine = getPipelineEngine();
-    if (!engine) return { error: 'PipelineEngine nao inicializado' };
+  ipcMain.handle('pipeline:open-project-file', async (_event, args: { projectId: string; relativePath: string }) => {
     try {
-      await engine.acceptSprint(projectId, sprintIndex);
+      if (!args?.projectId || typeof args.relativePath !== 'string') {
+        return { error: 'projectId e relativePath obrigatorios' };
+      }
+      const project = getHarnessProject(args.projectId);
+      if (!project) return { error: 'Projeto nao encontrado' };
+      const projectRoot = path.resolve(project.projectPath);
+      const resolved = path.resolve(projectRoot, args.relativePath);
+      if (resolved !== projectRoot && !resolved.startsWith(projectRoot + path.sep)) {
+        return { error: 'Path fora do diretorio do projeto' };
+      }
+      if (!fs.existsSync(resolved)) {
+        return { error: 'Arquivo nao encontrado' };
+      }
+      shell.showItemInFolder(resolved);
       return { ok: true as const };
     } catch (err) {
-      logger.error({ err, projectId, sprintIndex }, 'pipeline:accept-sprint failed');
+      logger.error({ err, args }, 'pipeline:open-project-file failed');
       return { error: (err as Error).message };
     }
   });
 
-  ipcMain.handle('pipeline:reject-sprint', async (_event, projectId: string, sprintIndex: number) => {
-    const engine = getPipelineEngine();
-    if (!engine) return { error: 'PipelineEngine nao inicializado' };
+  ipcMain.handle('pipeline:open-smoke-test', async (_event, projectId: string) => {
     try {
-      await engine.rejectSprint(projectId, sprintIndex);
+      const project = getHarnessProject(projectId);
+      if (!project) return { error: 'Projeto nao encontrado' };
+      const docsCtx = getPipelineDocsContext(project.projectPath, project.pipelineDocsId ?? null);
+      const reportPath = docsCtx
+        ? docsCtx.resolveDocPath('smoke-test.md')
+        : path.join(project.projectPath, 'smoke-test.md');
+      const resolved = path.resolve(reportPath);
+      if (!fs.existsSync(resolved)) {
+        return { error: 'Smoke test report nao existe ainda' };
+      }
+      const projectRoot = path.resolve(project.projectPath);
+      if (resolved !== projectRoot && !resolved.startsWith(projectRoot + path.sep)) {
+        return { error: 'Path fora do diretorio do projeto' };
+      }
+      shell.showItemInFolder(resolved);
       return { ok: true as const };
     } catch (err) {
-      logger.error({ err, projectId, sprintIndex }, 'pipeline:reject-sprint failed');
+      logger.error({ err, projectId }, 'pipeline:open-smoke-test failed');
       return { error: (err as Error).message };
+    }
+  });
+
+  ipcMain.handle('pipeline:get-smoke-test-path', async (_event, projectId: string) => {
+    try {
+      const project = getHarnessProject(projectId);
+      if (!project) return { exists: false as const };
+      const docsCtx = getPipelineDocsContext(project.projectPath, project.pipelineDocsId ?? null);
+      const reportPath = docsCtx
+        ? docsCtx.resolveDocPath('smoke-test.md')
+        : path.join(project.projectPath, 'smoke-test.md');
+      const resolved = path.resolve(reportPath);
+      return { exists: fs.existsSync(resolved), path: resolved };
+    } catch (err) {
+      logger.warn({ err, projectId }, 'pipeline:get-smoke-test-path failed');
+      return { exists: false as const };
     }
   });
 
   ipcMain.handle('pipeline:decided', async (_event, projectId: string, blockId: string) => {
-    const engine = getPipelineEngine();
-    if (!engine) return { error: 'PipelineEngine nao inicializado' };
-    try {
-      await engine.approvePhase(projectId, { blockId });
+    ensureProjectLock(projectId, 'pipeline-engine');
+    return withPipelineEngine(getPipelineEngine, async (e) => {
+      await e.approvePhase(projectId, { blockId });
       return { ok: true as const };
-    } catch (err) {
-      logger.error({ err, projectId, blockId }, 'pipeline:decided failed');
-      return { error: (err as Error).message };
-    }
+    });
   });
 
   ipcMain.handle('pipeline:conclude', async (_event, projectId: string) => {
-    const engine = getPipelineEngine();
-    if (!engine) return { error: 'PipelineEngine nao inicializado' };
-    try {
-      await engine.approvePhase(projectId);
+    ensureProjectLock(projectId, 'pipeline-engine');
+    return withPipelineEngine(getPipelineEngine, async (e) => {
+      await e.approvePhase(projectId);
       return { ok: true as const };
-    } catch (err) {
-      logger.error({ err, projectId }, 'pipeline:conclude failed');
-      return { error: (err as Error).message };
-    }
+    });
   });
 
   ipcMain.handle('pipeline:confirm-development', async (_event, projectId: string) => {
-    const engine = getPipelineEngine();
-    if (!engine) return { error: 'PipelineEngine nao inicializado' };
-    try {
-      await engine.confirmStartDevelopment(projectId);
+    ensureProjectLock(projectId, 'pipeline-engine');
+    return withPipelineEngine(getPipelineEngine, async (e) => {
+      await e.confirmStartDevelopment(projectId);
       return { ok: true as const };
-    } catch (err) {
-      logger.error({ err, projectId }, 'pipeline:confirm-development failed');
-      return { error: (err as Error).message };
-    }
+    });
   });
 
   ipcMain.handle('pipeline:retry', async (_event, projectId: string) => {
     const engine = getPipelineEngine();
     if (!engine) return { error: 'PipelineEngine nao inicializado' };
+    // S4.1: idempotente — retry pos-restart precisa readquirir lock liberado por
+    // recoverInterruptedPipelines. Pre-restart o lock pode ja estar em poder do
+    // mesmo projeto e ensureProjectLock vira no-op.
+    ensureProjectLock(projectId, 'pipeline-engine');
     try {
       const project = getHarnessProject(projectId);
       if (!project) return { error: 'Project not found' };
@@ -2234,22 +2392,23 @@ export function registerIPCHandlers(
   ipcMain.handle('pipeline:list-projects', () => {
     try {
       const projects = listHarnessProjects();
-      return projects.map((p) => ({
-        id: p.id,
-        name: p.name,
-        specPath: p.specPath,
-        status: p.status as 'idle' | 'running' | 'paused' | 'done' | 'failed' | 'aborted',
-        currentPhase: (p.pipelineCurrentPhase ?? null) as number | null,
-        createdAt: p.createdAt,
-        updatedAt: p.updatedAt,
-        metadata: {
-          startPhase: p.pipelineStartPhase ?? 1,
-          totalSprints: p.totalSprints > 0 ? p.totalSprints : null,
-          totalFeatures: p.totalFeatures > 0 ? p.totalFeatures : null,
-          currentSprintIndex: p.pipelineSprintIndex ?? null,
-          totalSprintsCount: p.totalSprints > 0 ? p.totalSprints : null,
-        },
-      }));
+      return projects.map((p) => {
+        const secSummary = p.pipelineType === 'security'
+          ? getSecuritySummaryJson(p.id)
+          : null;
+        return {
+          // S7.6: campos comuns extraidos via mapPipelineProject.
+          ...mapPipelineProject(p),
+          metadata: {
+            startPhase: p.pipelineStartPhase ?? 1,
+            totalSprints: p.totalSprints > 0 ? p.totalSprints : null,
+            totalFeatures: p.totalFeatures > 0 ? p.totalFeatures : null,
+            currentSprintIndex: p.pipelineSprintIndex ?? null,
+            totalSprintsCount: p.totalSprints > 0 ? p.totalSprints : null,
+            ...(secSummary !== null ? { securitySummary: secSummary } : {}),
+          },
+        };
+      });
     } catch (err) {
       logger.error({ err }, 'pipeline:list-projects failed');
       return [];
@@ -2263,8 +2422,15 @@ export function registerIPCHandlers(
     startPhase: number;
     specPath?: string;
     prdPath?: string;
+    pipelineType?: 'development' | 'security' | 'feature';
   }) => {
     try {
+      const resolvedType = data.pipelineType ?? 'development';
+      const pipelineDocsId =
+        resolvedType === 'feature' || resolvedType === 'security'
+          ? generatePipelineDocsId()
+          : null;
+
       const project = insertHarnessProject({
         name: data.name,
         description: data.description ?? '',
@@ -2277,13 +2443,26 @@ export function registerIPCHandlers(
           plannerAgentId: 'harness-planner',
           stack: [],
         },
+        pipelineType: resolvedType,
+        pipelineDocsId,
       });
+      if (pipelineDocsId) {
+        const sprintsMigration = migrateHarnessSprintsToPipelineDocs(project, pipelineDocsId);
+        if (sprintsMigration.status !== 'source-missing') {
+          updateHarnessProject(project.id, { sprintsJsonPath: sprintsMigration.pathToPersist });
+        }
+        logger.info(
+          { projectId: project.id, pipelineDocsId, sprintsMigration },
+          'pipeline:create-project applied sprints path migration/registration',
+        );
+      }
       updateHarnessProjectPipelineMeta(project.id, {
         pipelineStartPhase: data.startPhase,
         pipelineCurrentPhase: data.startPhase,
         prdPath: data.prdPath ?? null,
         status: 'idle',
       });
+      getPipelineDocsContext(data.projectPath, pipelineDocsId);
       return { id: project.id };
     } catch (err) {
       logger.error({ err, data }, 'pipeline:create-project failed');
@@ -2306,30 +2485,35 @@ export function registerIPCHandlers(
       const p = getHarnessProject(projectId);
       if (!p) return { error: 'Project not found' };
       const sprints = getHarnessSprints(projectId);
-      const currentPhase = (p.pipelineCurrentPhase ?? null) as number | null;
+      // S7.6: campos comuns extraidos via mapPipelineProject. currentPhase
+      // sai de la pra reusar na deriva do awaitingUser abaixo.
+      const base = mapPipelineProject(p);
 
-      // Conversation phases (1, 3, 5-10, 12) await user input when the project
-      // is reopened (there is no active stream at that moment). This is the
-      // rehydration counterpart of the pipeline:phase-changed event — without
-      // it, after a main-process restart the frontend keeps awaitingUser=false
+      // Conversation phases await user input when the project is reopened.
+      // This is the rehydration counterpart of the pipeline:phase-changed event:
+      // without it, after a main-process restart the frontend keeps awaitingUser=false
       // and the "Aprovar" button stays hidden even though the phase is
       // effectively waiting on the user. See BUG-19.
-      const CONVERSATION_PHASES = new Set([1, 3, 5, 6, 7, 8, 9, 10, 12]);
+      const conversationSet = p.pipelineType === 'security'
+        ? SECURITY_CONVERSATION_PHASES
+        : p.pipelineType === 'architecture-review'
+          ? ARCHITECTURE_CONVERSATION_PHASES
+          : DEV_CONVERSATION_PHASES;
+
       const awaitingUser =
-        currentPhase !== null &&
-        CONVERSATION_PHASES.has(currentPhase) &&
+        base.currentPhase !== null &&
+        conversationSet.has(base.currentPhase) &&
         p.status !== 'done' &&
         p.status !== 'failed';
 
+      const secSummary = p.pipelineType === 'security'
+        ? getSecuritySummaryJson(projectId)
+        : null;
+
       return {
-        id: p.id,
-        name: p.name,
-        specPath: p.specPath,
-        status: p.status as 'idle' | 'running' | 'paused' | 'done' | 'failed' | 'aborted',
-        currentPhase,
+        ...base,
         awaitingUser,
-        createdAt: p.createdAt,
-        updatedAt: p.updatedAt,
+        ...(secSummary !== null ? { metadata: { securitySummary: secSummary } } : {}),
         sprints: sprints.map((s) => ({
           index: s.sprintIndex,
           name: s.name,
@@ -2345,6 +2529,43 @@ export function registerIPCHandlers(
     } catch (err) {
       logger.error({ err, projectId }, 'pipeline:get-project failed');
       return { error: (err as Error).message };
+    }
+  });
+
+  // feat-027: NEW, returns security agent statuses for Phase 2 of security pipeline
+  ipcMain.handle('pipeline:get-security-agent-status', (_event, projectId: string) => {
+    try {
+      return getSecurityAgentStatuses(projectId);
+    } catch (err) {
+      logger.error({ err, projectId }, 'pipeline:get-security-agent-status failed');
+      return [];
+    }
+  });
+
+  ipcMain.handle('pipeline:get-audit-agents-state', (_event, projectId: string) => {
+    try {
+      if (!projectId) return { error: 'projectId obrigatorio' };
+      return { agents: getAuditAgentsState(projectId) };
+    } catch (err) {
+      logger.error({ err, projectId }, 'pipeline:get-audit-agents-state failed');
+      return { error: (err as Error).message };
+    }
+  });
+
+  // Read the repo profiler manifest.json from disk for rehydration of the
+  // security pipeline phase 1 view. Returns null when the project is not a
+  // security pipeline or the manifest has not been written yet.
+  ipcMain.handle('pipeline:read-manifest', (_event, projectId: string) => {
+    try {
+      const project = getHarnessProject(projectId);
+      if (!project || project.pipelineType !== 'security' || !project.projectPath) return null;
+      const manifestPath = path.join(project.projectPath, '.lionclaw', 'manifest.json');
+      if (!fs.existsSync(manifestPath)) return null;
+      const raw = fs.readFileSync(manifestPath, 'utf-8');
+      return JSON.parse(raw);
+    } catch (err) {
+      logger.error({ err, projectId }, 'pipeline:read-manifest failed');
+      return null;
     }
   });
 
@@ -2365,21 +2586,42 @@ export function registerIPCHandlers(
       // Map phase number to the appropriate file path on the project (14-phase numbering)
       let filePath: string | null = null;
       if (phase === 1) {
-        filePath = project.discoveryNotesPath ?? null;
+        filePath = findPipelineDocReadPath(
+          project.projectPath,
+          project.pipelineDocsId ?? null,
+          'discovery.md',
+          'discovery-notes.md',
+          project.discoveryNotesPath,
+        );
       } else if (phase === 2 || phase === 3) {
         // User stories / requisitos (generated in phase 2, reviewed in phase 3)
-        filePath = project.projectPath
-          ? path.join(project.projectPath, 'stories-requisitos.md')
-          : null;
+        filePath = findPipelineDocReadPath(
+          project.projectPath,
+          project.pipelineDocsId ?? null,
+          'stories-requisitos.md',
+          'stories-requisitos.md',
+        );
       } else if (phase === 4 || phase === 5 || phase === 6 || phase === 7 || phase === 8) {
         // PRD Completo (phase 4) and tech decision phases (5-8) all reference the PRD
-        filePath = project.prdPath ?? null;
+        filePath = findPipelineDocReadPath(
+          project.projectPath,
+          project.pipelineDocsId ?? null,
+          'PRD.md',
+          'PRD.md',
+          project.prdPath,
+        );
       } else if (phase === 9 || phase === 10) {
         // SPEC (Spec Generation phase 9, Spec Enricher phase 10)
-        filePath = project.specPath ?? null;
+        filePath = findPipelineDocReadPath(
+          project.projectPath,
+          project.pipelineDocsId ?? null,
+          'SPEC.md',
+          'SPEC.md',
+          project.specPath,
+        );
       } else if (phase === 11 || phase === 12 || phase === 13 || phase === 14) {
         // Sprints JSON (Planner phase 11, Sprint Validator phase 12, Coder/Evaluator phases 13-14)
-        filePath = project.sprintsJsonPath ?? null;
+        filePath = findHarnessSprintsReadPath(project);
       }
 
       if (!filePath) {
@@ -2402,6 +2644,10 @@ export function registerIPCHandlers(
   ipcMain.handle('pipeline:reset-phase', async (_event, projectId: string, phase: number) => {
     const engine = getPipelineEngine();
     if (!engine) return { error: 'PipelineEngine nao inicializado' };
+    // Reset eh "continuar execucao" do ponto de vista do lock — proxima fase auto
+    // sera disparada em background. ensureProjectLock idempotente cobre caso
+    // pos-restart onde o Map em RAM esta vazio.
+    ensureProjectLock(projectId, 'pipeline-engine');
     try {
       return await engine.resetPhase(projectId, phase);
     } catch (err) {
@@ -2413,6 +2659,7 @@ export function registerIPCHandlers(
   ipcMain.handle('pipeline:reset-sprint', async (_event, projectId: string, sprintIndex: number) => {
     const engine = getPipelineEngine();
     if (!engine) return { error: 'PipelineEngine nao inicializado' };
+    ensureProjectLock(projectId, 'pipeline-engine');
     try {
       return await engine.resetSprint(projectId, sprintIndex);
     } catch (err) {
@@ -2437,6 +2684,53 @@ export function registerIPCHandlers(
       const project = getHarnessProject(projectId);
       if (!project) return { error: 'Project not found' };
 
+      // --- Security pipeline: phases 1, 2, 3, 5, 7 read their own artifacts ---
+      if (project.pipelineType === 'security') {
+        const result = readSecurityPhaseArtifact(project, phase);
+        if (result !== null) return result;
+        // fall through to default empty return for unmapped security phases
+        return { type: 'markdown' as const, content: '' };
+      }
+
+      // --- Architecture-review pipeline: phases 1-4 return MD + JSON pair ---
+      if (project.pipelineType === 'architecture-review') {
+        // Phase 8 (Planner): return sprint list from DB, same as other pipelines.
+        // For dev/feature this is phase 11; for architecture-review/security it is phase 8.
+        // Without this branch, the UI shows "Ainda nao ha artefato para esta fase" even
+        // though the planner already wrote sprints-<runId>.json and the DB rows.
+        if (phase === 8) {
+          const sprints = getHarnessSprints(projectId);
+          return { type: 'sprints' as const, sprints };
+        }
+        const ctx = getArchitectureReviewContext(project);
+        if (!ctx) return { type: 'markdown' as const, content: '' };
+        const stems: Record<number, { md: string; json: string } | undefined> = {
+          1: { md: ctx.mapMdPath,         json: ctx.mapJsonPath },
+          2: { md: ctx.candidatesMdPath,  json: ctx.candidatesJsonPath },
+          3: { md: ctx.diagnosisMdPath,   json: ctx.diagnosisJsonPath },
+          4: { md: ctx.decisionsMdPath,   json: ctx.decisionsJsonPath },
+          5: { md: ctx.specPath,          json: '' },
+          6: { md: ctx.specPath,          json: '' },
+          7: { md: ctx.specPath,          json: '' },
+        };
+        const paths = stems[phase];
+        if (!paths) return { type: 'markdown' as const, content: '' };
+        const safeRead = (p: string): string | null => {
+          if (!p || !fs.existsSync(p)) return null;
+          try {
+            return fs.readFileSync(p, 'utf-8');
+          } catch {
+            return null;
+          }
+        };
+        return {
+          type: 'architecture' as const,
+          phase,
+          markdown: safeRead(paths.md),
+          json: safeRead(paths.json),
+        };
+      }
+
       // Phase 11: return sprint list from DB
       if (phase === 11) {
         const sprints = getHarnessSprints(projectId);
@@ -2446,11 +2740,28 @@ export function registerIPCHandlers(
       // File-based phases
       let filePath: string | null = null;
       if (phase === 2) {
-        filePath = project.projectPath ? path.join(project.projectPath, 'stories-requisitos.md') : null;
+        filePath = findPipelineDocReadPath(
+          project.projectPath,
+          project.pipelineDocsId ?? null,
+          'stories-requisitos.md',
+          'stories-requisitos.md',
+        );
       } else if (phase === 4) {
-        filePath = project.projectPath ? path.join(project.projectPath, 'PRD.md') : null;
+        filePath = findPipelineDocReadPath(
+          project.projectPath,
+          project.pipelineDocsId ?? null,
+          'PRD.md',
+          'PRD.md',
+          project.prdPath,
+        );
       } else if (phase === 9) {
-        filePath = project.specPath ?? path.join(project.projectPath, 'SPEC.md');
+        filePath = findPipelineDocReadPath(
+          project.projectPath,
+          project.pipelineDocsId ?? null,
+          'SPEC.md',
+          'SPEC.md',
+          project.specPath,
+        );
       }
 
       if (!filePath) return { type: 'markdown' as const, content: '' };
@@ -2497,6 +2808,83 @@ export function registerIPCHandlers(
     }
   });
 
+  // ---- Codex CLI ----
+  ipcMain.handle('codex:status', async () => {
+    const { isCodexAvailable } = await import('./codex-bridge');
+    return isCodexAvailable();
+  });
+
+  ipcMain.handle('codex:test', async () => {
+    const { spawn } = await import('child_process');
+    const { resolveCodexBinary } = await import('./codex-bridge');
+    const resolvedPath = await resolveCodexBinary();
+    const customPath = resolvedPath || getSetting('codex_binary_path') || 'codex';
+    const useShell = process.platform === 'win32' && customPath.toLowerCase().endsWith('.cmd');
+
+    return new Promise<{ ok: boolean; message: string }>((resolve) => {
+      const child = spawn(customPath, ['login', 'status'], { stdio: ['ignore', 'pipe', 'pipe'], shell: useShell });
+      let out = '';
+      let err = '';
+      child.stdout.on('data', (d: Buffer) => { out += d.toString(); });
+      child.stderr.on('data', (d: Buffer) => { err += d.toString(); });
+      const timeout = setTimeout(() => {
+        child.kill();
+        resolve({ ok: false, message: 'Timeout — codex nao respondeu' });
+      }, 10_000);
+      child.on('close', (code: number | null) => {
+        clearTimeout(timeout);
+        if (code === 0) resolve({ ok: true, message: out.trim() || 'Logged in' });
+        else resolve({ ok: false, message: (err || out).trim() || `codex login status exited ${code}` });
+      });
+      child.on('error', (e: Error) => {
+        clearTimeout(timeout);
+        resolve({ ok: false, message: `Erro ao executar codex: ${e.message}` });
+      });
+    });
+  });
+
+  ipcMain.handle('codex:open-login', async () => {
+    const { spawn } = await import('child_process');
+    const platform = process.platform;
+    const cmd = 'codex login';
+
+    if (platform === 'darwin') {
+      spawn('osascript', ['-e', `tell application "Terminal" to do script "${cmd}"`]);
+    } else if (platform === 'win32') {
+      spawn('cmd', ['/c', 'start', 'cmd', '/k', cmd], { detached: true, shell: true });
+    } else {
+      const term = spawn('gnome-terminal', ['--', 'bash', '-c', `${cmd}; exec bash`], { detached: true });
+      term.on('error', () => {
+        spawn('xterm', ['-e', `bash -c "${cmd}; exec bash"`], { detached: true });
+      });
+    }
+    return { ok: true };
+  });
+
+  ipcMain.handle('codex:set-binary-path', async (_event, path: string) => {
+    setSetting('codex_binary_path', path);
+    return { ok: true };
+  });
+
+  // SPEC-codex-windows-fix.md Camada 2: handlers do fluxo de consent + prep.
+  ipcMain.handle('codex:check-prep-needed', async (_event, projectPath: string) => {
+    const { checkProjectNeedsPrep } = await import('./codex-windows-prep');
+    return checkProjectNeedsPrep(projectPath);
+  });
+
+  ipcMain.handle('codex:apply-prep', async (_event, repoRoot: string) => {
+    const { applyPrepWithConsent } = await import('./codex-windows-prep');
+    return applyPrepWithConsent(repoRoot);
+  });
+
+  ipcMain.handle('codex:grant-consent', async (_event, payload: { repoRoot: string; action: 'skip' }) => {
+    const { grantSkipConsent } = await import('./codex-windows-prep');
+    if (payload.action === 'skip') {
+      grantSkipConsent(payload.repoRoot);
+      return { ok: true };
+    }
+    return { ok: false, error: 'Unsupported action' };
+  });
+
   logger.info('All IPC handlers registered');
 }
-

@@ -16,22 +16,10 @@ import {
 } from 'lucide-react';
 import type { PersonalTask, PersonalTaskFilters } from '@/types';
 
-const STATUS_LABELS: Record<string, string> = {
-  pending: 'Pendente',
-  in_progress: 'Em andamento',
-  done: 'Concluida',
-};
-
 const PRIORITY_LABELS: Record<string, string> = {
   low: 'Baixa',
   normal: 'Normal',
   high: 'Alta',
-};
-
-const PERIOD_LABELS: Record<string, string> = {
-  last30: '30 dias',
-  last90: '90 dias',
-  all: 'Tudo',
 };
 
 function PriorityIcon({ priority }: { priority: string }) {

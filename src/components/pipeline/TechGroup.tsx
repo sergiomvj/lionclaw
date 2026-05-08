@@ -71,8 +71,6 @@ const GROUP_STATUS_BORDER: Record<PhaseDisplayStatus, string> = {
   skipped:   'border-zinc-700 bg-zinc-900',
 };
 
-const TECH_PHASE_NUMBERS = new Set([5, 6, 7, 8]);
-
 function resolveGroupStatus(
   techPhases: PhaseDefinition[],
   currentPhase: number | null,
@@ -97,6 +95,10 @@ export interface TechGroupProps {
   phaseStatus: string;
   metricsMap: Map<number, PipelinePhaseMetrics>;
   onSelectPhase: (phase: number) => void;
+  /** Main label for the group badge (e.g. "TECH", "VALIDAÇÃO"). Defaults to "TECH". */
+  groupLabel?: string;
+  /** Tooltip shown on hover. Defaults to a generic message. */
+  tooltip?: string;
 }
 
 export function TechGroup({
@@ -105,16 +107,21 @@ export function TechGroup({
   phaseStatus,
   metricsMap,
   onSelectPhase,
+  groupLabel = 'TECH',
+  tooltip,
 }: TechGroupProps) {
-  const isCurrentInTech = currentPhase !== null && TECH_PHASE_NUMBERS.has(currentPhase);
-  const [expanded, setExpanded] = useState(isCurrentInTech);
+  // Derive member phase numbers from the passed `phases` so this component
+  // works for any group (tech, skeptic, ...) without hardcoded IDs.
+  const memberNumbers = new Set<number>(phases.map((p) => p.number));
+  const isCurrentInGroup = currentPhase !== null && memberNumbers.has(currentPhase);
+  const [expanded, setExpanded] = useState(isCurrentInGroup);
 
-  // Auto-expand when the current phase enters the tech group
+  // Auto-expand when the current phase enters the group
   useEffect(() => {
-    if (isCurrentInTech) {
+    if (isCurrentInGroup) {
       setExpanded(true);
     }
-  }, [isCurrentInTech]);
+  }, [isCurrentInGroup]);
 
   const groupStatus = resolveGroupStatus(phases, currentPhase, phaseStatus, metricsMap);
   const borderClass = GROUP_STATUS_BORDER[groupStatus];
@@ -125,9 +132,12 @@ export function TechGroup({
     : groupStatus === 'failed'    ? 'text-red-400'
     : 'text-zinc-500';
 
+  const resolvedTooltip = tooltip
+    ?? `${groupLabel} (${phases.map((p) => p.abbreviation).join(' / ')}) — clique para ${expanded ? 'recolher' : 'expandir'}`;
+
   return (
     <div className="flex flex-col items-center shrink-0">
-      {/* Main TECH badge */}
+      {/* Main group badge */}
       <button
         onClick={() => setExpanded((prev) => !prev)}
         className={`
@@ -135,10 +145,10 @@ export function TechGroup({
           border transition-all duration-200 cursor-pointer
           ${borderClass}
         `}
-        title={`Tech phases (DB / BE / FE / SEC) — clique para ${expanded ? 'recolher' : 'expandir'}`}
+        title={resolvedTooltip}
       >
         <span className={`text-[10px] font-bold leading-none ${groupTextColor}`}>
-          TECH
+          {groupLabel}
         </span>
         <div className="flex items-center justify-center h-3">
           <div className="flex items-center gap-0.5">

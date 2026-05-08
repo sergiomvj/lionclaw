@@ -1,208 +1,153 @@
 <div align="center">
-  <img src="LionLogoGit.png" alt="alt text" />
+  <img src="LionLogoGit.png" alt="LionClaw logo" />
 </div>
 
 # LionClaw
 
-Assistente pessoal de IA rodando como app desktop Electron. Single-user, single-machine. O agente tem acesso completo ao terminal, filesystem e internet via Claude Agent SDK.
+Assistente pessoal de IA em app desktop Electron. Single-user, single-machine, com acesso ao terminal, filesystem, internet, MCPs locais e agentes especializados.
+
+Versao atual do pacote: `2.2.0`
 
 ---
 
 ## Indice
 
 1. [Visao Geral](#visao-geral)
-2. [Funcionalidades](#funcionalidades)
-3. [Arquitetura](#arquitetura)
-4. [Pre-requisitos](#pre-requisitos)
-5. [Instalacao](#instalacao)
-6. [Comandos](#comandos)
-7. [Stack](#stack)
-8. [Boot Sequence](#boot-sequence)
-9. [Sistemas Principais](#sistemas-principais)
-10. [MCP Servers](#mcp-servers)
-11. [Estrutura do Projeto](#estrutura-do-projeto)
-12. [Troubleshooting](#troubleshooting)
-13. [Licenca](#licenca)
+2. [Novidades da 2.2](#novidades-da-22)
+3. [Pre-requisitos](#pre-requisitos)
+4. [Instalacao](#instalacao)
+5. [Configuracao de Chaves](#configuracao-de-chaves)
+6. [OpenRouter e Providers Externos](#openrouter-e-providers-externos)
+7. [Codex CLI](#codex-cli)
+8. [Pipelines](#pipelines)
+9. [Funcionalidades](#funcionalidades)
+10. [Arquitetura](#arquitetura)
+11. [Boot Sequence](#boot-sequence)
+12. [MCP Servers](#mcp-servers)
+13. [Comandos](#comandos)
+14. [Estrutura do Projeto](#estrutura-do-projeto)
+15. [Troubleshooting](#troubleshooting)
+16. [Licenca](#licenca)
 
 ---
 
 ## Visao Geral
 
-LionClaw e um assistente pessoal de IA que roda localmente no seu computador como aplicativo desktop. Diferente de chatbots web, ele tem acesso real ao seu terminal, arquivos e internet. Ele executa, nao apenas explica.
+LionClaw roda localmente como aplicativo desktop. Ele nao e um chatbot web: o main process do Electron orquestra agentes, banco SQLite, scheduler, MCPs, Knowledge Base, Telegram, Vault, CodeBurn e pipelines de implementacao. O renderer React so conversa com o main process via Electron IPC tipado.
 
-O agente principal (orquestrador) pode delegar tarefas para sub-agentes especializados, cada um com seu proprio modelo, ferramentas e permissoes. Toda comunicacao entre frontend e backend acontece via Electron IPC. Nao ha servidor web, nao ha portas expostas.
+Em producao nao existe servidor web separado nem API HTTP exposta. Dados ficam na maquina do usuario: `~/.lionclaw/`, SQLite local, keychain do sistema operacional para segredos e sqlite-vec para busca vetorial.
 
-Dados ficam exclusivamente na sua maquina: banco SQLite local, segredos no keychain do SO, embeddings vetoriais em sqlite-vec. Nada sai sem sua permissao.
+O runtime principal usa `@anthropic-ai/claude-agent-sdk` para agentes Claude. A versao 2.2 tambem inclui:
 
----
-
-## Funcionalidades
-
-### Chat com IA
-
-Interface principal de conversa com o agente. Suporta streaming de respostas em tempo real, visualizacao de tool calls (quais ferramentas o agente usou), rendering de Markdown com syntax highlighting, renderizacao de artefatos (Excalidraw, HTML, codigo), gravacao e reproducao de audio via ElevenLabs, anexos de arquivos e imagens, slash commands para acoes rapidas e contador de tokens por mensagem.
-
-O agente responde em portugues brasileiro por padrao (configuravel). Sessoes sao persistidas no SQLite com todo o historico de mensagens, tool calls e metricas de tokens.
-
-### Sub-Agentes
-
-Sistema de delegacao onde o orquestrador principal pode rotear tarefas para agentes especializados. Cada sub-agente tem configuracao independente: modelo (opus, sonnet, haiku ou modelo local via Ollama), system prompt customizado, ferramentas permitidas (Read, Write, Bash, Glob, etc.), MCP servers vinculados, skills vinculadas, nivel de esforco e thinking habilitado/desabilitado.
-
-Agentes com `runtime: local` usam Ollama e sao acessados via o MCP `local-agents`. Agentes com `runtime: cloud` sao registrados como sub-agentes nativos do Claude Agent SDK.
-
-Na primeira execucao, 8 seed agents sao criados automaticamente (detalhes na secao Boot Sequence). Apos a criacao, o usuario pode customizar livremente e as mudancas sobrevivem ao reboot.
-
-### Harness (Implementacao Automatizada)
-
-Pipeline automatizado de implementacao de codigo. O fluxo funciona em tres etapas:
-
-O **Planner** (modelo opus) recebe uma SPEC e decompoe em sprints com features e criterios de aceitacao. O **Coder** (modelo sonnet) implementa cada feature, escrevendo codigo real no projeto. O **Evaluator** valida o codigo contra os criterios de aceitacao e gera feedback.
-
-O ciclo coder -> evaluator -> feedback -> coder repete ate todos os criterios passarem ou o limite de rounds ser atingido. Cada round coleta metricas: tokens de input/output/cache, custo (USD), duracao, tool uses e API requests.
-
-Interface dedicada com dashboard de projetos, visualizacao de sprints, painel de streaming do agente em tempo real e graficos de metricas.
-
-### BuildPlan (Workflow de Especificacao)
-
-Pipeline completo que transforma uma ideia em especificacao tecnica pronta para implementacao. O fluxo passa por 6 etapas:
-
-**Discovery**: agente conduz entrevista estruturada (11 perguntas em 5 blocos) para entender o escopo do projeto, gerando um `discovery-notes.md`.
-
-**PRD Generator**: gera user stories, requisitos funcionais e nao-funcionais a partir das notas de discovery. Produz documento PRD completo com resumo executivo, personas, requisitos e metricas de sucesso.
-
-**PRD Validator**: valida e refina user stories e requisitos com o usuario em conversa interativa. Garante que nada foi esquecido ou mal definido antes de prosseguir.
-
-**Spec Build**: agente spec-builder (opus) gera uma SPEC.md completa a partir do PRD, cobrindo database (tabelas, campos, constraints, indexes, RLS), backend (endpoints com metodo, path, request/response, auth, status codes) e frontend (componentes, estados, fluxos).
-
-**Spec Validate**: agente spec-validator audita a SPEC contra o PRD e o codigo existente, reportando erros, inconsistencias e lacunas.
-
-**Approval**: usuario revisa, discute e aprova a SPEC antes de enviar pro Harness.
-
-Apos aprovacao, o Harness recebe a SPEC e o **Sprint Validator** verifica cobertura completa, dependencias corretas e sizing realista antes do Planner decompor em sprints executaveis.
-
-### Enrich (Enriquecimento de SPEC)
-
-Pipeline conversacional de duas fases para melhorar uma SPEC antes da implementacao:
-
-**Fase 1 - Validator**: auditor tecnico que cruza a SPEC contra o codigo existente e o PRD. Apresenta relatorio estruturado com categorias (erros, inconsistencias, scope creep, lacunas vs PRD, definicoes vagas). Cada item e discutido com o usuario e editado na SPEC apos aprovacao. Usa arquivo de relatorio persistente como memoria entre turnos.
-
-**Fase 2 - Enricher**: adiciona edge cases, estados de UI, fluxos alternativos, tratamento de erros e permissoes que a SPEC original nao cobriu. Opera em isolamento total (nao sabe que o Validator existe).
-
-A transicao entre fases e explicita: o usuario clica "Aprovar e Avancar" para matar o Validator e iniciar o Enricher com contexto limpo.
-
-### Knowledge Base
-
-Sistema de ingestion e busca semantica sobre documentos. Suporta PDF, DOCX, CSV e Markdown. O fluxo funciona assim: o documento e parseado e dividido em chunks, cada chunk recebe um embedding via Anthropic Embeddings API, os embeddings sao armazenados em sqlite-vec para busca vetorial.
-
-Na busca, a query do usuario e convertida em embedding e comparada vetorialmente com os chunks indexados. Resultados relevantes sao injetados no contexto do agente.
-
-Cada agente pode ter sua propria base de conhecimento. O MCP `knowledge-base` e auto-injetado em agentes que tem documentos indexados.
-
-### Skills
-
-Skills sao instrucoes estruturadas em Markdown (com frontmatter YAML) que ensinam o agente a executar tarefas especificas. Diferente de tools (que sao acoes atomicas), skills sao guias completos com contexto, exemplos e regras.
-
-O sistema funciona via o MCP `skills` que expoe tres ferramentas: `list_skills` (lista skills disponiveis com filtro por categoria), `load_skill` (carrega o conteudo completo de uma skill) e `get_skill_metadata` (retorna metadados sem o conteudo).
-
-Quando um agente tem skills vinculadas, o MCP de skills e auto-injetado e instrucoes de uso sao adicionadas ao prompt. O agente carrega a skill sob demanda quando a tarefa exige.
-
-Na primeira execucao, 15 skills default sao copiadas automaticamente (design, ferramentas, documentos). Novas skills podem ser criadas pela interface ou pelo proprio agente.
-
-### Memory Pipeline
-
-Sistema de memoria em camadas. A **memoria de trabalho** (MEMORY.md) e carregada em todo prompt e contem contexto volatil da sessao atual. A **memoria semantica** usa embeddings para busca vetorial sobre mensagens antigas, acessada via MCP `memory-search`. A **compactacao** resume conversas longas usando LLM (cloud ou Ollama local) para manter o contexto gerenciavel.
-
-Na inicializacao, SOUL.md + RULES.md + USER.md + MEMORY.md sao concatenados em um CLAUDE.md que o SDK le automaticamente. Esse arquivo e regenerado a cada boot e quando qualquer fonte muda (watcher com polling de 2 segundos).
-
-### Scheduler
-
-Agendador de tarefas baseado em cron. Suporta expressoes cron padrao via `cron-parser`, execucao sob demanda, interface com calendario e kanban, e log de execucoes. Tarefas agendadas podem acionar o agente para executar qualquer acao (enviar relatorio, checar status, etc).
-
-### Secrets Vault
-
-Gerenciamento seguro de credenciais. Chaves de API, tokens e senhas sao armazenadas no keychain nativo do SO via `node-keytar` (Keychain no macOS, Credential Manager no Windows, libsecret no Linux). Se o keytar falhar, existe fallback para arquivo criptografado local em `~/.lionclaw/data/.secrets`.
-
-Nunca em arquivos de texto, nunca em variaveis de ambiente commitadas, nunca no banco SQLite.
-
-### Telegram Bridge
-
-Integracao bidirecional com Telegram. Permite conversar com o LionClaw de qualquer lugar via bot do Telegram. Mensagens recebidas sao roteadas para o orquestrador, respostas sao enviadas de volta ao chat. Configuracao via token do BotFather, com autenticacao por TOTP.
-
-### Permission Guard
-
-Todas as acoes do agente passam por um sistema de permissoes. Ferramentas seguras (Read, Glob, Grep, WebSearch, WebFetch) sao auto-aprovadas. Write/Edit em paths permitidos sao auto-aprovados. Acoes destrutivas (rm, sudo, git push, envio de email) exigem confirmacao do usuario via popup. Acoes desconhecidas sao negadas por padrao. Toda tool call e registrada no audit trail.
-
-### Usage Analytics
-
-Dashboard com metricas de consumo: tokens de input, output e cache por sessao, custo em USD por modelo (calculado via pricing.ts), historico de uso ao longo do tempo e breakdown por agente.
-
-### Auth
-
-Sistema de autenticacao local com hash de senha via bcrypt e suporte a TOTP (autenticacao de dois fatores) via otplib. A sessao e trancada automaticamente quando o sistema entra em suspensao ou o usuario trava a tela.
+- runtime `external` para OpenRouter, OpenAI direto e providers OpenAI-compatible;
+- runtime `codex` via OpenAI Codex CLI autenticado por OAuth;
+- runtime `local` para Ollama, LM Studio e endpoints locais compativeis.
 
 ---
 
-## Arquitetura
+## Novidades da 2.2
 
+### Pipeline unificado
+
+A tela **Pipeline** concentra quatro tipos de fluxo:
+
+| Tipo | Uso |
+|------|-----|
+| `development` | Criar produto do zero: discovery, PRD, SPEC, planejamento e implementacao |
+| `feature` | Adicionar uma feature a um projeto existente |
+| `security` | Auditoria multi-agente de seguranca e qualidade, gerando SPEC de correcao |
+| `architecture-review` | Mapeamento arquitetural, triagem de alvo, diagnostico, decisoes e SPEC |
+
+### Security Audit Pipeline
+
+Novo pipeline de seguranca com Repo Profiler, sete auditores em paralelo limitado a 3 agentes, deduplicacao, validadores ceticos, SPEC, planner e ciclo Coder/Evaluator.
+
+Auditores da fase 2:
+
+- Secrets Scanner
+- Auth Auditor
+- Isolation Inspector
+- Duplication Detector
+- Logic Analyzer
+- Standards Checker
+- OWASP Scanner
+
+O fluxo gera artefatos em `.lionclaw/Security/`, inclui `manifest.json`, relatorios parciais, relatorio consolidado, resumo executivo e `SecurityScan-*.json` para tracking de resolucao.
+
+### Architecture Review Pipeline
+
+Novo fluxo para entender uma codebase antes de implementar mudancas grandes:
+
+1. Mapeamento arquitetural
+2. Triagem de alvos
+3. Diagnostico arquitetural
+4. Entrevista de decisao
+5. Spec Generation
+6. Spec Validation
+7. Spec Enricher
+8. Planner
+9. Sprint Validator
+10. Coder
+11. Evaluator
+
+Os artefatos ficam em:
+
+```text
+<projectPath>/.lionclaw/pipelines/architecture-review/<runId>/
+  manifest.json
+  ArchitectureMap-<runId>.md
+  ArchitectureMap-<runId>.json
+  ArchitectureCandidates-<runId>.md
+  ArchitectureCandidates-<runId>.json
+  ArchitectureDiagnosis-<runId>.md
+  ArchitectureDiagnosis-<runId>.json
+  ArchitectureDecisions-<runId>.md
+  ArchitectureDecisions-<runId>.json
+  ArchitectureSpecSource-<runId>.md
+  SPEC-<runId>.md
+  sprints-<runId>.json
 ```
-                        +-----------------+
-                        |    Renderer     |
-                        |  React + Vite   |
-                        |  (BrowserWindow)|
-                        +--------+--------+
-                                 |
-                            Electron IPC
-                          (contextBridge)
-                                 |
-                        +--------+--------+
-                        |  Main Process   |
-                        |    Node.js      |
-                        +--------+--------+
-                                 |
-            +--------------------+--------------------+
-            |          |         |         |          |
-     +------+---+ +---+----+ +-+------+ +-+------+ +-+--------+
-     |Orchestrator| |  DB   | |Harness | |Enrich  | |Scheduler |
-     |Agent SDK   | |SQLite | |Engine  | |Engine  | |Cron      |
-     +------+---+ +--------+ +--------+ +--------+ +----------+
-            |
-    +-------+-------+
-    |       |       |
-  +--+--+ +-+--+ +-+--+
-  |Sub  | |Sub | |Sub |
-  |Agent| |Agt | |Agt |
-  +-----+ +----+ +----+
-            |
-     +------+------+
-     |  MCP Servers |
-     |  (stdio)     |
-     +--------------+
-```
 
-O **Renderer** (React) so se comunica com o **Main Process** (Node.js) via IPC tipado. Toda logica de negocio, acesso ao banco, chamadas de API e execucao de ferramentas acontecem no main process. O renderer nunca tem acesso direto ao Node.js.
+### OpenRouter e OpenAI externo
 
-O **Orchestrator** gerencia uma fila de mensagens (pattern message queue) e delega para sub-agentes via Agent SDK. Cada sub-agente pode ter seus proprios MCP servers, tools e system prompt.
+Agentes agora podem usar runtime `external` com providers OpenRouter, OpenAI direto ou qualquer endpoint OpenAI-compatible. As chaves ficam no Vault, nao em `.env`.
+
+### Codex CLI
+
+Agentes podem usar runtime `codex`, rodando o OpenAI Codex CLI por OAuth. Esse runtime usa ferramentas nativas do Codex, sandbox `workspace-write` por padrao e nao usa MCPs, Skills ou Knowledge Base do LionClaw durante a execucao.
+
+### Codex no Windows
+
+Existe um health check especifico para Windows para evitar falhas de `apply_patch` por CRLF e encoding PowerShell 5.1. O app pode preparar o repo com consentimento do usuario.
+
+### CodeBurn
+
+A tela **Usage** foi substituida por um terminal embutido do CodeBurn. O LionClaw inicia `codeburn report` via `node-pty` e renderiza no xterm.js.
+
+### Seeds e DB atualizados
+
+O boot garante todos os seed agents por uma chamada unica (`ensureAllSeedAgents`) e materializa snapshots em `~/.lionclaw/agents/<id>/config.json`. O banco esta na migration V57.
 
 ---
 
 ## Pre-requisitos
 
 | Ferramenta | Versao Minima | Como verificar | Como instalar |
-|------------|--------------|----------------|---------------|
+|------------|---------------|----------------|---------------|
 | **Node.js** | v18+ (recomendado v22) | `node --version` | [nodejs.org](https://nodejs.org/) |
 | **npm** | v9+ | `npm --version` | Ja vem com o Node.js |
 | **Python** | 3.10+ | `python --version` | [python.org](https://www.python.org/) |
-| **Git** | qualquer | `git --version` | [git-scm.com](https://git-scm.com/) |
+| **Git** | qualquer versao recente | `git --version` | [git-scm.com](https://git-scm.com/) |
 
-### Build Tools para modulos nativos
+Modulos que podem exigir build nativo: `better-sqlite3`, `keytar`, `sqlite-vec` e `node-pty`.
 
-O projeto usa modulos nativos (better-sqlite3, keytar, bcrypt, sqlite-vec) que precisam ser compilados durante `npm install`.
+Build tools por sistema:
 
-**Windows**: Visual Studio Build Tools com o workload "Desktop development with C++". Alternativa rapida: `npm install -g windows-build-tools`
-
-**macOS**: Xcode Command Line Tools: `xcode-select --install`
-
-**Linux**: `sudo apt install build-essential python3 libsecret-1-dev`
+| Sistema | Requisito |
+|---------|-----------|
+| macOS | Xcode Command Line Tools: `xcode-select --install` |
+| Windows | Visual Studio Build Tools com workload "Desktop development with C++". Alternativa rapida: `npm install -g windows-build-tools` |
+| Linux | `sudo apt install build-essential python3 libsecret-1-dev` |
 
 ---
 
@@ -221,31 +166,46 @@ cd lionclawv1.0
 npm install
 ```
 
-Instala todas as dependencias, incluindo modulos nativos e compila automaticamente todos os MCP servers via `postinstall`. Se houver erro de compilacao, verifique os Build Tools acima.
+O `npm install` instala todas as dependencias, incluindo modulos nativos, e compila automaticamente todos os MCP servers via `postinstall` (`npm run build:mcps`). Se houver erro de compilacao, verifique os Build Tools acima.
 
 > [!WARNING]
-> **Para usuarios de Windows:** Apos rodar o `npm install`, e necessario recompilar as bibliotecas nativas para a versao interna de Node.js que o Electron utiliza. Caso contrario, o app ira falhar ao iniciar com o erro `ERR_DLOPEN_FAILED`.
-> Rode o comando:
+> **Para usuarios de Windows:** apos rodar `npm install`, e necessario recompilar as bibliotecas nativas para a versao interna de Node.js que o Electron utiliza. Caso contrario, o app pode falhar ao iniciar com `ERR_DLOPEN_FAILED`.
+>
+> Comando recomendado neste repo:
+>
+> ```bash
+> npm run rebuild:electron
+> ```
+>
+> Alternativa equivalente:
+>
 > ```bash
 > npx electron-rebuild
 > ```
 
 ### 3. Configurar a API Key
 
-O LionClaw nao usa arquivos `.env` para segredos. Chaves sao armazenadas no keychain do SO.
+O LionClaw nao usa arquivos `.env` para segredos de usuario. Chaves sao armazenadas no keychain do sistema operacional.
 
-Na primeira execucao, o app abre o fluxo de onboarding e pede sua API Key. Tambem pode ser configurado em **Settings > API Keys** dentro do app.
+Na primeira execucao, o app abre o fluxo de onboarding e pede sua API Key. Depois disso, as chaves podem ser configuradas no **Vault** dentro do app.
 
-Chave obrigatoria: `ANTHROPIC_API_KEY`
-
-Chaves opcionais (ativar conforme necessidade):
+Chave obrigatoria:
 
 | Chave | Para que serve |
 |-------|----------------|
-| `OPENAI_API_KEY` | Memory Search (embeddings) |
-| `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET` | Google Calendar, Gmail, Drive, Sheets, YouTube |
+| `ANTHROPIC_API_KEY` | Agentes Claude via Claude Agent SDK |
+
+Chaves opcionais principais:
+
+| Chave | Para que serve |
+|-------|----------------|
+| `OPENAI_API_KEY` | Embeddings da memoria e Knowledge Base, transcricao |
+| `HARNESS_OPENROUTER_KEY` | Agentes externos via OpenRouter |
+| `HARNESS_OPENAI_KEY` | Agentes externos via OpenAI direto |
+| `COHERE_API_KEY` | Reranking na Knowledge Base |
+| `GOOGLE_CLIENT_ID` + `GOOGLE_CLIENT_SECRET` + tokens OAuth | Google Calendar, Gmail, Drive, Sheets, YouTube |
 | `ELEVENLABS_API_KEY` | Sintese de voz |
-| `GOOGLE_GEMINI_API_KEY` | Geracao de imagens (Nano Banana) |
+| `GOOGLE_GEMINI_API_KEY` | Geracao de imagens via Nano Banana |
 | `SHOPIFY_STORE_URL` + credenciais | Integracao Shopify |
 
 ### 4. Rodar
@@ -260,28 +220,498 @@ Abre o app Electron com React dev server (Vite HMR), main process com auto-resta
 
 Na primeira execucao, o app cria `~/.lionclaw/` com:
 
-```
+```text
 ~/.lionclaw/
   SOUL.md               Identidade e personalidade do agente
   RULES.md              Regras de seguranca e operacao
-  USER.md               Perfil do usuario (preenchido no onboarding)
+  USER.md               Perfil do usuario, preenchido no onboarding
   MEMORY.md             Memoria de trabalho
-  BOOTSTRAP.md          Ritual de onboarding (usado so na primeira sessao)
-  CLAUDE.md             Contexto consolidado (gerado automaticamente)
+  BOOTSTRAP.md          Ritual de onboarding, usado na primeira sessao
+  CLAUDE.md             Contexto consolidado, gerado automaticamente
   .claude/
     settings.json       Isolamento do SDK
-  agents/               Configuracoes de sub-agentes
-  skills/               15 skills default (design, ferramentas, documentos)
+  agents/               Configuracoes e snapshots de sub-agentes
+  skills/               Skills default
   workflows/
     build-plan/
       stages/           Stage files do BuildPlan
   conversations/        Transcricoes arquivadas
+  background/           CWD isolado para scheduler e Telegram
   data/
-    lionclaw.db         Banco SQLite (27 migracoes)
+    lionclaw.db         Banco SQLite
     sessions/           Sessions do Agent SDK
 ```
 
-O onboarding conduz uma entrevista para conhecer o usuario e definir a identidade do agente.
+O onboarding conduz uma entrevista inicial para conhecer o usuario e definir preferencias do agente.
+
+---
+
+## Configuracao de Chaves
+
+Segredos sao armazenados no keychain do sistema operacional via `node-keytar`. Se o keytar falhar, o LionClaw usa fallback criptografado local em `~/.lionclaw/data/.secrets`.
+
+Abra **Vault** dentro do app e configure as chaves necessarias.
+
+| Chave | Obrigatoria | Uso |
+|-------|-------------|-----|
+| `ANTHROPIC_API_KEY` | Sim | Agentes Claude via Claude Agent SDK |
+| `OPENAI_API_KEY` | Nao | Embeddings `text-embedding-3-small` e transcricao |
+| `HARNESS_OPENROUTER_KEY` | Nao | Agentes runtime `external` via OpenRouter |
+| `HARNESS_OPENAI_KEY` | Nao | Agentes runtime `external` via OpenAI direto |
+| `COHERE_API_KEY` | Nao | Reranking na Knowledge Base |
+| `ELEVENLABS_API_KEY` | Nao | Voz sintetica |
+| `GOOGLE_GEMINI_API_KEY` | Nao | Nano Banana, geracao de imagens |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `GOOGLE_REFRESH_TOKEN`, `GOOGLE_ACCESS_TOKEN` | Nao | Gmail, Drive, Sheets, Calendar, YouTube |
+| `SHOPIFY_STORE_URL`, `SHOPIFY_CLIENT_ID`, `SHOPIFY_CLIENT_SECRET` | Nao | MCP Shopify |
+
+O app nao deve depender de chaves commitadas em `.env`. Para development local, `.env` pode existir para tooling auxiliar, mas segredos de usuario devem ir para o Vault.
+
+---
+
+## OpenRouter e Providers Externos
+
+### Configurar OpenRouter
+
+1. Crie uma API key no OpenRouter: [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys).
+2. No LionClaw, abra **Vault**.
+3. Edite **OpenRouter API Key**.
+4. Cole a chave no formato `sk-or-v1-...`.
+5. Clique em **Testar conexao**.
+6. Em **Sub-Agentes**, crie ou edite um agente.
+7. Em **Runtime**, escolha `External`.
+8. Em **Provider**, escolha `OpenRouter`.
+
+Preset aplicado pelo app:
+
+| Campo | Valor |
+|-------|-------|
+| Base URL | `https://openrouter.ai/api/v1` |
+| Vault key | `HARNESS_OPENROUTER_KEY` |
+| Test endpoint | `/auth/key` |
+| Default model | `deepseek/deepseek-v4-pro` |
+| Headers extras | `HTTP-Referer: https://lionclaw.app`, `X-Title: LionClaw` |
+
+O runtime `external` chama endpoints OpenAI-compatible (`/v1/chat/completions`) e suporta tool calling quando o provider/modelo suporta.
+
+Referencia oficial: [OpenRouter API Authentication](https://openrouter.ai/docs/api-keys).
+
+### Modelos OpenRouter no catalogo
+
+| Modelo | Label no app | Contexto |
+|--------|--------------|----------|
+| `deepseek/deepseek-v4-pro` | DeepSeek V4 Pro | 1M |
+| `deepseek/deepseek-v4-flash` | DeepSeek V4 Flash | 1M |
+| `moonshotai/kimi-k2.6` | Kimi K2.6 | 256K |
+| `moonshotai/kimi-k2-thinking` | Kimi K2 Thinking | 256K |
+| `qwen/qwen3.6-max-preview` | Qwen 3.6 Max Preview | 262K |
+| `qwen/qwen3.6-plus` | Qwen 3.6 Plus | 262K |
+| `minimax/minimax-m2.7` | MiniMax M2.7 | 196K |
+| `minimax/minimax-m2.5` | MiniMax M2.5 | 196K |
+| `minimax/minimax-m1` | MiniMax M1 | 1M |
+| `z-ai/glm-4.7` | GLM 4.7 | 202K |
+| `z-ai/glm-4.7-flash` | GLM 4.7 Flash | 202K |
+
+### OpenAI direto
+
+Provider `OpenAI` usa:
+
+| Campo | Valor |
+|-------|-------|
+| Base URL | `https://api.openai.com/v1` |
+| Vault key | `HARNESS_OPENAI_KEY` |
+| Modelos | `gpt-5.5`, `gpt-5.5-pro` |
+
+Essa chave e separada de `OPENAI_API_KEY`, que e usada para embeddings e audio.
+
+### Custom OpenAI-compatible
+
+Use provider `Custom (OpenAI-compatible)` para APIs locais ou de terceiros.
+
+Campos:
+
+- Base URL manual
+- Model slug manual ou carregado via `/v1/models`
+- Vault key no formato `HARNESS_CUSTOM_<SLUG>_KEY`
+- Context window manual
+- Headers extras em JSON
+
+---
+
+## Codex CLI
+
+O runtime `codex` usa o OpenAI Codex CLI instalado na maquina do usuario. O LionClaw nao pede API key separada para esse runtime; ele usa a autenticacao local do CLI.
+
+Referencias oficiais: [Codex CLI Getting Started](https://help.openai.com/en/articles/11096431-openai-codex-ci-getting-started) e [Codex CLI Sign in with ChatGPT](https://help.openai.com/en/articles/11381614).
+
+### Instalar
+
+```bash
+npm install -g @openai/codex
+```
+
+### Conectar no LionClaw
+
+1. Abra **Settings**.
+2. Va para **Codex CLI**.
+3. Clique em **Conectar Codex**.
+4. O app abre um terminal externo executando `codex login`.
+5. Complete o login no browser.
+6. Volte ao LionClaw e clique em **Testar conexao**.
+
+O status checa:
+
+- se o binario `codex` existe;
+- a versao via `codex --version`;
+- se existe `~/.codex/auth.json`;
+- se `codex login status` retorna sucesso.
+
+Se o binario nao estiver no `PATH`, configure **Path customizado do binario** em Settings. No Windows, o app tambem procura em `%APPDATA%\npm\codex.cmd` e caminhos equivalentes do usuario.
+
+### Modelos Codex no app
+
+| Modelo | Descricao no app |
+|--------|------------------|
+| `gpt-5.5` | Frontier, codex-tuned, recomendado |
+| `gpt-5.4` | Generalista frontier |
+| `gpt-5.4-mini` | Mais barato e rapido |
+| `gpt-5.3-codex` | Variante codex-tuned legado |
+| `gpt-5.2` | Anterior, generalista |
+
+O agente Codex tambem tem `reasoningEffort`: `low`, `medium` ou `high`.
+
+### Como criar um agente Codex
+
+1. Abra **Sub-Agentes**.
+2. Crie ou edite um agente.
+3. Em **Runtime**, escolha `Codex`.
+4. Escolha modelo e reasoning effort.
+5. Salve.
+
+Notas importantes:
+
+- Codex usa sandbox `workspace-write` por padrao.
+- Codex usa ferramentas nativas de read/write/exec do CLI.
+- Tools, MCPs, Skills e Knowledge Base do LionClaw sao ignorados nesse runtime.
+- O permission guard do LionClaw nao intermedeia as operacoes internas do Codex. A protecao vem do sandbox e das regras do Codex CLI.
+- O pipeline captura metricas, comandos executados, arquivos alterados e falhas repetidas de patch.
+
+### Windows Health Check do Codex
+
+No Windows, o Codex CLI pode sofrer com CRLF e encoding do PowerShell 5.1. O LionClaw implementa um fluxo de preparo com consentimento.
+
+O dialog aparece somente quando todas as condicoes abaixo sao verdadeiras:
+
+- sistema operacional Windows;
+- path do projeto resolve para um repo Git;
+- Codex CLI esta instalado e autenticado;
+- existe pelo menos um agente Codex ativo;
+- o health check detecta issues acionaveis;
+- o usuario ainda nao autorizou ou pulou a preparacao para aquela versao do prep.
+
+Issues detectadas:
+
+| Issue | Severidade | O que significa |
+|-------|------------|-----------------|
+| `autocrlf-true` | Alta | `core.autocrlf=true`, checkout pode converter LF para CRLF |
+| `no-gitattributes` | Media | `.gitattributes` ausente ou sem regra `eol=lf` |
+| `mixed-line-endings` | Media | index e working tree divergem em line endings |
+| `powershell-5.1` | Baixa | informativo sobre encoding CP-1252 |
+
+Ao clicar **Preparar**, o app executa:
+
+```bash
+git config core.autocrlf false
+git add --renormalize .
+git reset
+```
+
+E cria ou atualiza `.gitattributes` com:
+
+```text
+* text=auto eol=lf
+```
+
+Guardrails:
+
+- nao roda fora do Windows;
+- nao roda em repos com submodules;
+- exige working tree limpo antes de aplicar;
+- nao faz commit;
+- permite **Agora nao** ou **Nunca para este projeto**;
+- reemite warning se o problema persistir e o usuario nao tiver optado por pular.
+
+Se o Codex acumular 3 falhas de `apply_patch verification failed`, o pipeline mostra um warning especifico sugerindo Health Check.
+
+---
+
+## Pipelines
+
+### Development Pipeline
+
+| Fase | Nome | Tipo |
+|------|------|------|
+| 1 | Discovery | Conversa |
+| 2 | PRD Generator | Auto |
+| 3 | PRD Validator | Conversa |
+| 4 | PRD Completo | Auto |
+| 5 | Database | Conversa |
+| 6 | Backend | Conversa |
+| 7 | Frontend | Conversa |
+| 8 | Security | Conversa |
+| 9 | Spec Generation | Auto |
+| 10 | Spec Enricher | Conversa |
+| 11 | Planner | Auto |
+| 12 | Sprint Validator | Conversa |
+| 13 | Coder | Loop |
+| 14 | Evaluator | Loop |
+
+Entry points disponiveis:
+
+- Discovery: comecar do zero.
+- Spec Builder: quando ja existe PRD e decisoes tecnicas.
+- Planner: quando ja existe SPEC aprovada.
+
+### Feature Pipeline
+
+Versao do Development Pipeline voltada a um repositorio existente. Comeca por Feature Discovery e segue por PRD, tech review, SPEC, planner e implementacao.
+
+Entry point atual: Feature Discovery.
+
+### Security Pipeline
+
+| Fase | Nome | Tipo |
+|------|------|------|
+| 1 | Repo Profiler | Auto |
+| 2 | Security Audit | Auto multi-agente |
+| 3 | Deduplicador | Auto |
+| 4 | Skeptic Security | Conversa |
+| 5 | Skeptic Quality | Conversa |
+| 6 | SPEC Generator | Auto |
+| 7 | SPEC Enricher | Conversa |
+| 8 | Planner | Auto |
+| 9 | Sprint Validator | Conversa |
+| 10 | Coder | Loop |
+| 11 | Evaluator | Loop |
+
+Entry points:
+
+- Scan Completo: profiling, auditoria, validacao e correcao automatizada.
+- SPEC a partir de relatorio: quando ja existe um `Security-*.md`.
+
+### Architecture Review Pipeline
+
+| Fase | Nome | Tipo |
+|------|------|------|
+| 1 | Mapeamento Arquitetural | Auto |
+| 2 | Triagem de Alvos | Conversa |
+| 3 | Diagnostico Arquitetural | Auto |
+| 4 | Entrevista de Decisao | Conversa |
+| 5 | Spec Generation | Auto |
+| 6 | Spec Validation | Conversa |
+| 7 | Spec Enricher | Conversa |
+| 8 | Planner | Auto |
+| 9 | Sprint Validator | Conversa |
+| 10 | Coder | Loop |
+| 11 | Evaluator | Loop |
+
+Entry point atual: Mapeamento Completo.
+
+### Reset, pausa e historico
+
+A tela Pipeline suporta:
+
+- pausar e abortar pipeline;
+- retry de fase;
+- reset de fase ou sprint com preview;
+- historico por fase;
+- preview de documentos gerados;
+- metricas por fase e por agente;
+- tracking de sprints, rounds, custo e duracao.
+
+---
+
+## Funcionalidades
+
+### Chat
+
+Chat com streaming, tool calls visiveis, Markdown com GFM, anexos, imagens, audio, artefatos e slash commands. Sessoes e mensagens ficam no SQLite.
+
+### Sub-Agentes
+
+Cada agente tem configuracao propria:
+
+- runtime: `cloud`, `local`, `external` ou `codex`;
+- modelo;
+- prompt;
+- tools;
+- MCP servers;
+- skills;
+- effort;
+- thinking;
+- max turns;
+- max tool rounds;
+- squad.
+
+Agentes `cloud` rodam pelo Claude Agent SDK. Agentes `local` usam Ollama, LM Studio ou OpenAI-compatible local. Agentes `external` usam HTTP OpenAI-compatible. Agentes `codex` usam Codex CLI.
+
+### Knowledge Base
+
+Ingestao de PDF, DOCX, CSV e Markdown. O sistema faz parse, chunking, embeddings e busca hibrida. Embeddings usam OpenAI `text-embedding-3-small` quando `OPENAI_API_KEY` existe, com fallback Ollama se configurado e se as dimensoes baterem.
+
+### Skills
+
+Skills sao instrucoes em Markdown com frontmatter. O MCP `skills` expoe `list_skills`, `load_skill` e `get_skill_metadata`. Agentes com skills vinculadas recebem o MCP automaticamente.
+
+### Enrich
+
+Fluxo conversacional de duas fases para melhorar uma SPEC antes da implementacao:
+
+1. Validator: cruza SPEC, PRD e codigo existente.
+2. Enricher: adiciona edge cases, estados de UI, fluxos alternativos, tratamento de erros e permissoes.
+
+### Scheduler e Tasks
+
+Scheduler baseado em `cron-parser`, com execucao sob demanda, historico de runs, calendario, kanban e filtros.
+
+### Vault
+
+Vault com keychain do SO e fallback criptografado. A UI permite salvar, testar e apagar chaves conhecidas.
+
+### Telegram
+
+Bridge bidirecional com Telegram via bot token. Conversas sao roteadas para o orquestrador e retornam ao Telegram.
+
+### CodeBurn
+
+Dashboard de uso via CodeBurn embutido em terminal xterm.js. O main process resolve o binario Node do sistema e executa `codeburn report`.
+
+### Auth
+
+Autenticacao local com bcrypt e TOTP. O app bloqueia a sessao em suspend e lock-screen.
+
+### Permission Guard
+
+Ferramentas seguras sao auto-aprovadas. Acoes destrutivas exigem confirmacao via popup. Durante auditoria de seguranca, leitura direta de `.env*` e bloqueada: o agente deve verificar historico Git e `.gitignore` sem abrir secrets.
+
+---
+
+## Arquitetura
+
+```text
+Renderer React + Vite
+        |
+        | Electron IPC via contextBridge
+        v
+Main Process Node.js + TypeScript
+        |
+        +-- Orchestrator
+        +-- Agent Runtime Executors
+        |     +-- cloud: Claude Agent SDK
+        |     +-- local: Ollama, LM Studio, OpenAI-compatible
+        |     +-- external: OpenRouter, OpenAI, custom HTTP
+        |     +-- codex: OpenAI Codex CLI
+        |
+        +-- SQLite + sqlite-vec
+        +-- PipelineEngine
+        +-- HarnessEngine
+        +-- KnowledgeEngine
+        +-- Scheduler
+        +-- MCP Manager
+        +-- Telegram Bridge
+        +-- Vault
+```
+
+Regras importantes:
+
+- Renderer nunca acessa Node.js diretamente.
+- Todo acesso a banco fica no main process.
+- Todos os IPCs passam pelo preload.
+- Todas as operacoes SQLite usam prepared statements.
+- Segredos nunca ficam no banco nem em arquivos plaintext.
+- MCPs rodam como subprocessos stdio.
+- Pipelines gravam artefatos no projeto alvo, normalmente dentro de `.lionclaw/`.
+
+---
+
+## Boot Sequence
+
+Sequencia resumida do boot atual:
+
+1. Registra handlers de excecao e shutdown.
+2. Registra protocolo `lionclaw-asset://`.
+3. Cria arquivos base em `~/.lionclaw/`.
+4. Copia skills default se ainda nao existem.
+5. Gera `CLAUDE.md` a partir de `SOUL.md`, `RULES.md`, `USER.md` e `MEMORY.md`.
+6. Inicia watcher desses arquivos.
+7. Inicializa SQLite e aplica migrations ate V57.
+8. Roda `seedToolDefaults`.
+9. Roda `ensureAllSeedAgents`.
+10. Registra entradas do Vault para OpenRouter e OpenAI externo.
+11. Inicia Knowledge Bridge.
+12. Inicia watcher de ingestao graph quando `mgraph_mode=true`.
+13. Instancia HarnessEngine e PipelineEngine.
+14. Registra IPC handlers.
+15. Garante MCPs built-in.
+16. Inicia MCPs ativos.
+17. Descobre MCPs remotos do SDK em background.
+18. Inicia Scheduler.
+19. Tenta iniciar Telegram bot se configurado.
+20. Cria BrowserWindow.
+21. Inicializa auto-updater em producao.
+22. Registra power monitor para auto-lock.
+
+### Diretorio `~/.lionclaw`
+
+```text
+~/.lionclaw/
+  SOUL.md
+  RULES.md
+  USER.md
+  MEMORY.md
+  BOOTSTRAP.md
+  CLAUDE.md
+  .claude/
+    settings.json
+  agents/
+    <agent-id>/
+      config.json
+  skills/
+  workflows/
+  conversations/
+  background/
+  data/
+    lionclaw.db
+    sessions/
+```
+
+---
+
+## MCP Servers
+
+MCPs built-in sao registrados no banco no boot. Servidores que exigem chave podem ficar inativos ate a configuracao no Vault.
+
+| ID | Ativo por padrao | Chaves | Uso |
+|----|------------------|--------|-----|
+| `memory-search` | Sim | `OPENAI_API_KEY`, `COHERE_API_KEY` opcionais | Busca em memoria semantica |
+| `excalidraw` | Sim | Nenhuma | Diagramas e whiteboard |
+| `local-llm` | Sim | Nenhuma | Ollama e modelos locais |
+| `knowledge-base` | Sim | Nenhuma | Busca em documentos indexados |
+| `skills` | Sim | Nenhuma | Carregamento de skills |
+| `graph-search` | Condicional | Nenhuma | Knowledge graph quando `mgraph_mode=true` |
+| `elevenlabs` | Nao | `ELEVENLABS_API_KEY` | Text-to-speech |
+| `nano-banana` | Nao | `GOOGLE_GEMINI_API_KEY` | Geracao de imagens |
+| `shopify` | Nao | Shopify | Integracao Shopify |
+| `google-gmail` | Nao | Google OAuth | Gmail |
+| `google-drive` | Nao | Google OAuth | Drive |
+| `google-sheets` | Nao | Google OAuth | Sheets |
+| `google-calendar` | Nao | Google OAuth | Calendar |
+| `youtube` | Nao | Google OAuth | YouTube |
+
+Auto-inject:
+
+- `knowledge-base` e injetado quando o agente tem Knowledge Base habilitada e documentos indexados.
+- `skills` e injetado quando o agente tem skills vinculadas.
+- `codex-agents` e criado in-process quando existe agente `runtime=codex` ativo.
 
 ---
 
@@ -289,299 +719,147 @@ O onboarding conduz uma entrevista para conhecer o usuario e definir a identidad
 
 | Comando | Descricao |
 |---------|-----------|
-| `npm run dev` | Inicia o app em modo desenvolvimento (hot reload) |
-| `npm run build` | Compila para producao (sem empacotar) |
-| `npm run dist` | Compila e empacota (DMG no Mac, NSIS no Windows) |
-| `npm run dist:mac` | Empacota apenas para macOS |
-| `npm run dist:win` | Empacota apenas para Windows |
+| `npm run dev` | Inicia Electron + Vite em modo desenvolvimento |
+| `npm run build` | Compila main e renderer |
+| `npm run preview` | Preview do build Electron Vite |
+| `npm run dist` | Build e empacotamento com electron-builder |
+| `npm run dist:mac` | Empacota para macOS |
+| `npm run dist:win` | Empacota para Windows |
 | `npm run build:mcps` | Compila todos os MCP servers |
-| `npm run typecheck` | Verifica tipos TypeScript (`tsc --noEmit`) |
-| `npm run lint` | ESLint |
+| `npm run build:excalidraw-bundle` | Gera bundle do Excalidraw |
+| `npm run rebuild:electron` | Rebuild de `better-sqlite3` e `node-pty` para Electron |
+| `npm run rebuild:node` | Rebuild de `better-sqlite3` e `node-pty` para Node |
+| `npm run typecheck` | TypeScript geral |
+| `npm run typecheck:main` | TypeScript main process |
+| `npm run typecheck:renderer` | TypeScript renderer |
 | `npm run test` | Vitest |
-| `npm run test:watch` | Testes em modo watch |
-
----
-
-## Stack
-
-| Componente | Tecnologia |
-|------------|------------|
-| Desktop runtime | Electron 33+ |
-| Frontend | React 19 + Vite 7 + TailwindCSS 4 |
-| State management | Zustand |
-| Backend (main process) | Node.js + TypeScript |
-| AI engine | @anthropic-ai/claude-agent-sdk |
-| Database | better-sqlite3 + sqlite-vec (vector search) |
-| Embeddings | @anthropic-ai/sdk (Anthropic Embeddings API) |
-| Alt LLMs | @google/genai (Gemini), cohere-ai, ollama (local) |
-| Scheduler | cron-parser |
-| Logger | pino + pino-pretty |
-| Secrets | node-keytar (OS keychain) + fallback criptografado |
-| Auth | bcrypt (hash) + otplib (TOTP) |
-| Telegram | node-telegram-bot-api |
-| Doc parsing | pdf-parse, mammoth (DOCX), csv-parse |
-| Terminal UI | xterm.js |
-| Markdown | react-markdown + remark-gfm |
-| Icons | lucide-react |
-| Google APIs | googleapis (OAuth2) |
-
----
-
-## Boot Sequence
-
-Sequencia completa do que acontece quando o app inicia:
-
-**1. Filesystem** (`ensureLionClawFiles`): cria `~/.lionclaw/` com SOUL.md, RULES.md, USER.md, MEMORY.md, BOOTSTRAP.md e subdiretorios.
-
-**2. Skills** (`copyDefaultSkills`): copia 15 skills default do projeto para `~/.lionclaw/skills/`. Nunca sobrescreve existentes.
-
-**3. CLAUDE.md** (`generateClaudeMd`): concatena SOUL + RULES + USER + MEMORY em um arquivo unico que o SDK le automaticamente. Inicia watcher para regenerar quando fontes mudam.
-
-**4. Database** (`initDatabase`): cria SQLite em `~/.lionclaw/data/lionclaw.db`, roda 27 migracoes, executa seeds:
-
-| Funcao | O que cria | Comportamento se ja existe |
-|--------|-----------|---------------------------|
-| `seedToolDefaults` | 12 tools nativas com estados default | Preserva config do usuario |
-| `ensureSkillCreatorAgent` | Agente skill-creator (sonnet) | Nao toca |
-| `ensureHarnessAgents` | Planner (opus), Coder (sonnet), Evaluator (sonnet) | Reconcilia prompt |
-| `ensureWorkflowAgents` | Spec Builder (opus), Spec Validator (sonnet) | Reconcilia prompt |
-| `ensureEnrichAgents` | Spec Validator Enrich (sonnet), Spec Enricher (sonnet) | Reconcilia prompt |
-
-**5. Workflow Files** (`bootstrapWorkflowFiles`): copia stage files do BuildPlan para runtime. Sempre sincroniza (para pegar atualizacoes).
-
-**6. Knowledge Bridge** (`startKnowledgeBridge`): inicia IPC bridge para o knowledge engine via Unix Domain Socket.
-
-**7. MCP Servers** (`ensureBuiltinMCPServers` + `startActiveMCPServers`): registra 13 MCPs no banco e inicia os que estao ativos.
-
-**8. SDK Discovery** (`discoverSDKMcpServers`): descobre MCPs remotos do Claude.ai em background.
-
-**9. Scheduler** (`startScheduler`): inicia cron runner.
-
-**10. Telegram** (`startTelegramBot`): tenta iniciar bot (falha silenciosamente sem token).
-
-**11. Window**: cria a BrowserWindow do Electron.
-
----
-
-## Sistemas Principais
-
-### Orchestrator
-
-Gerencia a fila de mensagens com pattern message queue. `submitMessage()` enfileira, `processQueue()` desenfileira e chama `executeQuery()`. Constroi definicoes de sub-agentes a partir do banco, incluindo tools (nativas + MCP locais + MCP remotos do Claude.ai), system prompts (RULES.md do agente + prompt customizado + instrucoes de skills) e MCP servers (montados via `buildMCPSpecForAgent`).
-
-Agentes locais (Ollama) sao filtrados e acessados via MCP `local-agents`. Agentes cloud viram sub-agentes nativos do SDK.
-
-### Harness Engine
-
-Tres agentes em loop: Planner decompoe SPEC em sprints, Coder implementa, Evaluator valida. Metricas coletadas por round via stream events do SDK (message_start para input tokens, message_delta para output, content_block_start para tool uses). Custo calculado por `calculateCost()` em pricing.ts.
-
-### Enrich Engine
-
-Duas fases conversacionais. Cada agente opera em isolamento total. O Validator salva relatorio em arquivo persistente (memoria entre turnos). Edita SPEC incrementalmente apos aprovacao do usuario. Write/Edit no specPath sao auto-aprovados via `setActiveEnrichSpecPath()` no permission guard.
-
-### Streaming
-
-Todos os pipelines (chat, harness, enrich) usam o mesmo formato `StreamChunk`: `{ type: 'text' | 'tool_call' | 'thinking' | 'done', ... }`. Events do Agent SDK sao transformados no main process e enviados ao renderer via IPC.
-
-### SQLite
-
-Banco unico em `~/.lionclaw/data/lionclaw.db`. WAL mode, foreign keys ON. 27 migracoes (V1-V27). Todas as operacoes exportadas de `db.ts` como funcoes. Sempre prepared statements, nunca concatenacao SQL.
-
-Tabelas principais: messages, sessions, agents, skills, mcp_servers, mcp_tool_registry, scheduled_tasks, task_executions, tool_audit_log, knowledge_documents, knowledge_chunks, harness_projects, harness_sprints, harness_rounds, workflow_runs, enrich_sessions, enrich_messages, token_usage, settings.
-
----
-
-## MCP Servers
-
-Servidores MCP (Model Context Protocol) sao processos independentes que expoem ferramentas ao agente via protocolo stdio JSON-RPC. O LionClaw gerencia o lifecycle (spawn, stop, restart) automaticamente.
-
-### Servidores Built-in
-
-| ID | Nome | Ativo por padrao | Requer chaves | Descricao |
-|----|------|:-:|---|-----------|
-| `excalidraw` | Excalidraw | Sim | - | Criacao de diagramas e whiteboard |
-| `local-llm` | Local LLM | Sim | - | Integracao com Ollama (modelos locais) |
-| `knowledge-base` | Knowledge Base | Sim | - | Busca semantica sobre documentos indexados |
-| `skills` | Skills | Sim | - | Acesso a skills por demanda (list, load, metadata) |
-| `memory-search` | Memory Search | Nao | OPENAI_API_KEY | Busca semantica sobre memoria do agente |
-| `graph-search` | Graph Search | Nao | - | Busca em knowledge graph (vault Obsidian). Requer `mgraph_mode` ativo |
-| `elevenlabs` | ElevenLabs | Nao | ELEVENLABS_API_KEY | Sintese de voz (TTS) |
-| `nano-banana` | Nano Banana | Nao | GOOGLE_GEMINI_API_KEY | Geracao de imagens via Google GenAI |
-| `shopify` | Shopify | Nao | 3 chaves Shopify | Integracao com loja Shopify |
-| `google-gmail` | Gmail | Nao | 4 chaves Google | Envio e leitura de emails |
-| `google-drive` | Google Drive | Nao | 4 chaves Google | Acesso ao Google Drive |
-| `google-sheets` | Google Sheets | Nao | 4 chaves Google | Leitura e escrita de planilhas |
-| `google-calendar` | Google Calendar | Nao | 4 chaves Google | Eventos e agenda |
-| `youtube` | YouTube | Nao | 4 chaves Google | Dados do YouTube |
-
-Servidores que requerem chaves nascem inativos. Ative-os em **Settings > MCP Servers** apos configurar as chaves correspondentes no Vault.
-
-### Auto-inject
-
-Dois MCPs sao injetados automaticamente em sub-agentes quando necessario:
-
-O **knowledge-base** e injetado quando o agente tem documentos indexados (`kb_enabled` e `getCompletedDocsCount > 0`). Recebe `KB_AGENT_ID` no env para filtrar por agente.
-
-O **skills** e injetado quando o agente tem skills vinculadas (`agent.skills.length > 0`). Instrucoes de uso sao adicionadas ao prompt.
-
-### MCPs Remotos (Claude.ai)
-
-MCPs gerenciados pelo Claude.ai (Stripe, Supabase, Notion, etc) sao acessados via Agent SDK. Suas tools tem prefixo `mcp__claude_ai_` e sao passadas diretamente do `allowed_tools` do agente, sem necessidade de registro no banco local.
+| `npm run test:watch` | Vitest em watch |
 
 ---
 
 ## Estrutura do Projeto
 
-```
+```text
 LionClaw/
   electron/
-    main/                       Processo principal (Node.js)
-      index.ts                  Entry point, boot sequence
-      orchestrator.ts           Message queue, sub-agente delegation
-      agent-engine.ts           Agent SDK wrapper
-      db.ts                     SQLite schema, migracoes, CRUD (~120KB)
-      ipc-handlers.ts           Todos os IPC handlers (~60KB)
-      permission-guard.ts       canUseTool callback, deteccao de acoes destrutivas
-      prompt-builder.ts         Construcao de system prompt
-      harness-engine.ts         Pipeline: planner -> coder -> evaluator
-      harness-planner.ts        Sprint planning via AI
-      harness-evaluator.ts      Avaliacao de codigo
-      harness-prompts.ts        Prompt builders (coder, evaluator, validator, enricher)
-      workflow-engine.ts        Orquestracao multi-etapa (BuildPlan)
-      knowledge-engine.ts       Ingestao, chunking, embedding, busca
-      knowledge-ipc-bridge.ts   IPC bridge para knowledge engine
-      memory-pipeline.ts        Compactacao, sumarizacao, embeddings
-      scheduler.ts              Cron runner
-      mcp-manager.ts            Lifecycle de MCP servers
-      mcp-discovery.ts          Discovery de MCPs do SDK
-      telegram-bridge.ts        Bot do Telegram
-      secrets-vault.ts          Encrypt/decrypt via keytar
-      auth.ts                   Password hash, TOTP, session tokens
-      pricing.ts                Calculo de custo por modelo
-      logger.ts                 Pino logger factory
-      paths.ts                  Utilitarios de path
-      ollama-client.ts          Cliente Ollama
-      image-engine.ts           Processamento de imagens
-      voice-engine.ts           Integracao ElevenLabs
-      artifact-detector.ts      Deteccao de artefatos em tool results
-      embedding-provider.ts     Provider de embeddings com fallback chain
-      seed-agents/              Configuracoes de agentes pre-built
-        index.ts                Registry com arrays HARNESS/WORKFLOW/ENRICH
-        harness-planner.ts      Planner (opus)
-        harness-coder.ts        Coder (sonnet)
-        harness-evaluator.ts    Evaluator (sonnet)
-        spec-builder.ts         SPEC generator (opus)
-        spec-validator.ts       SPEC validator (sonnet)
-        spec-validator-enrich.ts  SPEC validator para Enrich (sonnet)
-        spec-enricher.ts        SPEC enricher (sonnet)
+    main/
+      index.ts
+      orchestrator.ts
+      agent-runtime/
+      pipeline-engine/
+      harness-engine.ts
+      security-audit-runner.ts
+      repo-profiler.ts
+      codex-bridge.ts
+      codex-windows-prep.ts
+      codeburn-pty.ts
+      db.ts
+      ipc-handlers.ts
+      mcp-manager.ts
+      knowledge-engine.ts
+      scheduler.ts
+      telegram-bridge.ts
+      vault-registry.ts
+      seed-agents/
     preload/
-      index.ts                  contextBridge: window.lionclaw.*
-
-  src/                          React app (renderer)
-    App.tsx                     Page router, auth gate, IPC subscriptions
+      index.ts
+  src/
+    App.tsx
     pages/
-      ChatPage.tsx              Chat principal
-      SubAgentsPage.tsx         CRUD de agentes
-      SkillsPage.tsx            Gerenciamento de skills
-      MCPServersPage.tsx        Config de MCP servers
-      HarnessPage.tsx           Dashboard do Harness
-      BuildPlanPage.tsx         Workflow de especificacao
-      EnrichDocPage.tsx         Pipeline de enriquecimento
-      KnowledgePage.tsx         Knowledge base
-      SchedulerPage.tsx         Tarefas agendadas
-      TasksPage.tsx             Task management (kanban/calendario)
-      MemoryPage.tsx            Gerenciamento de memoria
-      RulesPage.tsx             Editor de regras globais
-      SettingsPage.tsx          Configuracoes do app
-      VaultPage.tsx             Secrets vault
-      UsagePage.tsx             Analytics de tokens
-      ChannelsPage.tsx          Integracao Telegram
-      PermissionsPage.tsx       Gerenciamento de permissoes
-      LogsPage.tsx              Logs do sistema
-      AuthPage.tsx              Login/TOTP
+      ChatPage.tsx
+      SubAgentsPage.tsx
+      PipelinePage.tsx
+      KnowledgePage.tsx
+      SettingsPage.tsx
+      VaultPage.tsx
+      UsagePage.tsx
     components/
-      chat/                     ChatMessage, ConfirmDialog, AskQuestionDialog,
-                                AudioPlayer, VoiceRecorder, TokenCounter,
-                                AgentThinking, ArtifactRenderer, SlashCommandPicker,
-                                ExcalidrawViewer, McpAppViewer
-      agents/                   AgentFormModal, DeleteAgentDialog
-      enrich/                   EnrichModal, EnrichControls, EnrichMetricsBar,
-                                EnrichPhaseIndicator, EnrichSessionCard, SpecViewer
-      harness/                  ProjectList, ProjectCard, ProjectDetail,
-                                NewProjectModal, ExecutionView, MetricsView,
-                                MetricsChart, SprintList, SprintCard,
-                                AgentStreamPanel, RegenerateModal
-      buildplan/                DiscoveryPanel, SpecGenerationView, ApprovalButtons
-      scheduler/                TaskList, TaskFormModal, CalendarView, KanbanView,
-                                ActivityBoard, ActivityCard, ActivityFilters
-      skills/                   SkillFormModal, SkillEditor, SkillWizard
-      settings/                 VoiceSelector, GoogleOAuthSetup
-      channels/                 TelegramSetup
-      common/                   Sidebar, MarkdownEditor, OpenFolderButton
+      chat/
+      agents/
+      pipeline/
+      settings/
     stores/
-      app-store.ts              Page routing, global state
-      auth-store.ts             Auth state
-      chat-store.ts             Chat sessions, messages
-      harness-store.ts          Harness projects, sprints
-      enrich-store.ts           Enrich sessions, messages, metrics
-      knowledge-store.ts        Knowledge base state
-      workflow-store.ts         Workflow state
+      app-store.ts
+      chat-store.ts
+      pipeline-store.ts
     types/
-      index.ts                  Todos os tipos TypeScript compartilhados
-
-  mcp-servers/                  15+ MCP servers (pacotes Node.js independentes)
-    google-calendar/            Google Calendar API
-    google-gmail/               Gmail API
-    google-drive/               Google Drive API
-    google-sheets/              Google Sheets API
-    google-shared/              Utilitarios compartilhados de auth Google
-    elevenlabs/                 Text-to-speech
-    excalidraw/                 Diagramas e whiteboard
-    knowledge-base/             Busca semantica
-    memory-search/              Busca semantica sobre memoria
-    local-agents/               Runner de agentes locais (Ollama)
-    local-llm/                  Integracao Ollama
-    skills/                     Skills MCP server
-    youtube/                    YouTube API
-    shopify/                    Shopify API
-    nano-banana/                Google GenAI (imagens)
-    graph-search/               Knowledge graph (Obsidian vault)
-
-  .lionclaw/                    Templates (copiados para ~/.lionclaw/ no primeiro boot)
-    skills/                     15 skills default (design, ferramentas, documentos)
-
-  resources/                    Icones e assets
-  scripts/                      Scripts de build auxiliares
-  tests/                        Testes (Vitest)
+      index.ts
+      pipeline.ts
+  mcp-servers/
+  resources/
+  scripts/
+  tests/
 ```
 
 ---
 
 ## Troubleshooting
 
-### Erro de compilacao de modulos nativos
+### Chat nao funciona
 
-Se `npm install` falhar ao compilar better-sqlite3, keytar, bcrypt ou sqlite-vec, verifique os Build Tools na secao Pre-requisitos.
+Configure `ANTHROPIC_API_KEY` no Vault. Essa chave e obrigatoria para agentes Claude.
 
-### O app abre mas o chat nao funciona
+### OpenRouter falha
 
-Verifique se a `ANTHROPIC_API_KEY` foi configurada em **Settings > API Keys**. A chave e armazenada no keychain do SO.
+Verifique:
 
-### MCP Servers nao funcionam
+- `HARNESS_OPENROUTER_KEY` esta no Vault;
+- a chave comeca com `sk-or-v1-`;
+- o provider do agente e `OpenRouter`;
+- a Base URL esta em `https://openrouter.ai/api/v1`;
+- o teste de conexao no Vault passa.
 
-Rode `npm run build:mcps` para compilar todos os servidores. Verifique os logs em **Logs** dentro do app. MCPs que requerem chaves de API so funcionam apos configurar as chaves no Vault.
+### Codex nao conecta
 
-### Erro de permissao ao acessar keytar
+Verifique:
 
-No Linux, instale `libsecret-1-dev` e reinicie o terminal. Se o keytar falhar, o app usa fallback com arquivo criptografado local.
+```bash
+codex --version
+```
 
-### Agentes locais (Ollama) nao respondem
+Depois rode o login pelo app ou manualmente no terminal. Se a sua versao do CLI nao aceitar `codex login`, atualize:
 
-Verifique se o Ollama esta rodando (`ollama serve`). O MCP `local-llm` e `local-agents` precisam estar ativos. O modelo configurado no agente precisa estar disponivel no Ollama (`ollama list`).
+```bash
+npm install -g @openai/codex
+```
+
+Depois autentique com o comando indicado pelo proprio CLI e clique **Testar conexao** no LionClaw.
+
+### Codex no Windows falha em patches
+
+Use o Health Check do Pipeline. O preparo exige working tree limpo. Se houver mudancas locais, commit ou stash antes. Repos com submodules sao pulados por seguranca.
+
+### CodeBurn nao abre
+
+Verifique:
+
+- `npm install` foi executado;
+- `node` esta no PATH do sistema;
+- `node-pty` foi recompilado para Electron com `npm run rebuild:electron`.
+
+### MCP nao inicia
+
+Rode:
+
+```bash
+npm run build:mcps
+```
+
+Depois veja logs na pagina **Logs**.
 
 ### Knowledge Base nao retorna resultados
 
-Verifique se os documentos foram indexados completamente (status "completed" na pagina Knowledge). Embeddings requerem `ANTHROPIC_API_KEY` valida.
+Verifique se os documentos estao com status `completed`. Para embeddings, configure `OPENAI_API_KEY` ou habilite Ollama com um modelo que retorne 1536 dimensoes.
+
+### Erro de keytar no Linux
+
+Instale:
+
+```bash
+sudo apt install libsecret-1-dev
+```
+
+Se o keytar ainda falhar, o app usa fallback criptografado local.
 
 ---
 

@@ -10,7 +10,6 @@ import type { VaultOperation, GraphData, GraphNode, GraphEdge, MgraphSearchResul
 const logger = createLogger('mgraph');
 
 const VAULT_SUBDIRS = ['entities', 'meetings', 'decisions', 'projects', 'references'] as const;
-type VaultSubdir = typeof VAULT_SUBDIRS[number];
 
 const MGRAPH_DIR = 'mgraph';
 

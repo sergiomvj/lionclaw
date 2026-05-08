@@ -1,7 +1,9 @@
 import fs from 'fs';
 import path from 'path';
 import { execSync } from 'child_process';
+import glob from 'glob';
 import { createLogger } from './logger';
+import type { McpSessionClient } from './mcp-tool-bridge';
 
 const logger = createLogger('local-tool-executor');
 
@@ -26,13 +28,54 @@ export interface LocalToolResult {
 
 type ToolImpl = (args: Record<string, unknown>, cwd: string) => Promise<LocalToolResult>;
 
+/**
+ * Validates that a target path (absolute or relative) resolves to a location
+ * inside the agent's project root (cwd). Path-traversal attempts (..) and absolute
+ * paths pointing outside cwd are rejected.
+ *
+ * Returns null if the path is safe; returns a LocalToolResult with isError=true
+ * if the path escapes the sandbox.
+ *
+ * Rationale: external runtime (OpenRouter etc.) models do not have implicit cwd
+ * awareness like the Claude SDK. They may hallucinate absolute paths to other
+ * projects on the filesystem. This sandbox prevents that.
+ */
+function validatePathInCwd(targetPath: string, cwd: string): LocalToolResult | null {
+  const cwdResolved = path.resolve(cwd);
+  const targetResolved = path.isAbsolute(targetPath)
+    ? path.resolve(targetPath)
+    : path.resolve(cwdResolved, targetPath);
+
+  const inside = targetResolved === cwdResolved
+    || targetResolved.startsWith(cwdResolved + path.sep);
+
+  if (!inside) {
+    logger.warn(
+      { targetPath, targetResolved, cwd: cwdResolved },
+      'Tool blocked: path outside project root',
+    );
+    return {
+      result:
+        `Error: path "${targetPath}" esta fora da raiz do projeto.\n` +
+        `PROJECT ROOT: ${cwdResolved}\n` +
+        `Use SEMPRE paths absolutos comecando com PROJECT ROOT, ou paths relativos que resolvam dentro dele.`,
+      isError: true,
+    };
+  }
+
+  return null;
+}
+
 // ---- Implementacoes individuais ----
 
-async function execRead(args: Record<string, unknown>): Promise<LocalToolResult> {
+async function execRead(args: Record<string, unknown>, cwd: string): Promise<LocalToolResult> {
   const filePath = args.file_path as string | undefined;
   if (!filePath) {
     return { result: 'Error: file_path e obrigatorio', isError: true };
   }
+
+  const sandboxError = validatePathInCwd(filePath, cwd);
+  if (sandboxError) return sandboxError;
 
   try {
     const raw = fs.readFileSync(filePath, 'utf-8');
@@ -48,13 +91,16 @@ async function execRead(args: Record<string, unknown>): Promise<LocalToolResult>
   }
 }
 
-async function execWrite(args: Record<string, unknown>): Promise<LocalToolResult> {
+async function execWrite(args: Record<string, unknown>, cwd: string): Promise<LocalToolResult> {
   const filePath = args.file_path as string | undefined;
   const content = args.content as string | undefined;
 
   if (!filePath || content === undefined) {
     return { result: 'Error: file_path e content sao obrigatorios', isError: true };
   }
+
+  const sandboxError = validatePathInCwd(filePath, cwd);
+  if (sandboxError) return sandboxError;
 
   try {
     fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -67,7 +113,7 @@ async function execWrite(args: Record<string, unknown>): Promise<LocalToolResult
   }
 }
 
-async function execEdit(args: Record<string, unknown>): Promise<LocalToolResult> {
+async function execEdit(args: Record<string, unknown>, cwd: string): Promise<LocalToolResult> {
   const filePath = args.file_path as string | undefined;
   const oldString = args.old_string as string | undefined;
   const newString = args.new_string as string | undefined;
@@ -75,6 +121,9 @@ async function execEdit(args: Record<string, unknown>): Promise<LocalToolResult>
   if (!filePath || !oldString) {
     return { result: 'Error: file_path e old_string sao obrigatorios', isError: true };
   }
+
+  const sandboxError = validatePathInCwd(filePath, cwd);
+  if (sandboxError) return sandboxError;
 
   try {
     let content = fs.readFileSync(filePath, 'utf-8');
@@ -98,24 +147,25 @@ async function execGlob(args: Record<string, unknown>, cwd: string): Promise<Loc
   }
 
   const basePath = (args.path as string | undefined) || cwd;
+  const sandboxError = validatePathInCwd(basePath, cwd);
+  if (sandboxError) return sandboxError;
 
   try {
-    // Usa find pra suportar patterns basicos. Para patterns mais avancados (ex: **/*.ts),
-    // convertemos para uma busca por extensao quando possivel.
-    const ext = pattern.match(/\*\*\/\*(\.\w+)$/)?.[1];
-    let cmd: string;
+    const matches = glob.sync(pattern, {
+      cwd: basePath,
+      nodir: true,
+      dot: false,
+      absolute: true,
+      ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**'],
+    });
 
-    if (ext) {
-      cmd = `find "${basePath}" -type f -name "*${ext}" 2>/dev/null | head -100`;
-    } else {
-      // Pattern simples: normaliza ** para * e usa find
-      const normalized = pattern.replace(/\*\*/g, '*');
-      cmd = `find "${basePath}" -type f -name "${normalized}" 2>/dev/null | head -100`;
+    if (matches.length === 0) {
+      return { result: 'Nenhum arquivo encontrado.', isError: false };
     }
 
-    const output = execSync(cmd, { encoding: 'utf-8', timeout: 10_000 });
-    const trimmed = output.trim();
-    return { result: trimmed || 'Nenhum arquivo encontrado.', isError: false };
+    const trimmed = matches.slice(0, 200).join('\n');
+    const suffix = matches.length > 200 ? `\n... (+${matches.length - 200} arquivos truncados)` : '';
+    return { result: trimmed + suffix, isError: false };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     logger.error({ pattern, basePath, err }, 'Glob tool failed');
@@ -130,6 +180,8 @@ async function execGrep(args: Record<string, unknown>, cwd: string): Promise<Loc
   }
 
   const searchPath = (args.path as string | undefined) || cwd;
+  const sandboxError = validatePathInCwd(searchPath, cwd);
+  if (sandboxError) return sandboxError;
   const glob = args.glob as string | undefined;
 
   try {
@@ -191,9 +243,9 @@ async function execBash(args: Record<string, unknown>, cwd: string): Promise<Loc
 // ---- Dispatcher principal ----
 
 const TOOL_MAP: Record<string, ToolImpl> = {
-  Read: (args, _cwd) => execRead(args),
-  Write: (args, _cwd) => execWrite(args),
-  Edit: (args, _cwd) => execEdit(args),
+  Read: (args, cwd) => execRead(args, cwd),
+  Write: (args, cwd) => execWrite(args, cwd),
+  Edit: (args, cwd) => execEdit(args, cwd),
   Glob: (args, cwd) => execGlob(args, cwd),
   Grep: (args, cwd) => execGrep(args, cwd),
   Bash: (args, cwd) => execBash(args, cwd),
@@ -235,3 +287,53 @@ export async function executeLocalTool(
 
 /** Lista de tools suportadas pelo executor local */
 export const SUPPORTED_LOCAL_TOOLS = Object.keys(TOOL_MAP) as ReadonlyArray<string>;
+
+/**
+ * Verifica se a tool e uma builtin local (Read, Write, Edit, Glob, Grep, Bash).
+ */
+export function isBuiltinTool(toolName: string): boolean {
+  return Object.prototype.hasOwnProperty.call(TOOL_MAP, toolName);
+}
+
+/**
+ * Dispatcher unificado de tools para o path external.
+ *
+ * Roteia a chamada para:
+ * - `executeLocalTool` quando a tool e builtin (Read, Write, Edit, Glob, Grep, Bash)
+ * - `callMCPTool`      quando a tool comeca com `mcp__` e um mcpClient esta presente
+ *
+ * Lanca erro para tools desconhecidas ou quando MCP e solicitado sem client.
+ *
+ * NOTA: Este dispatcher e usado EXCLUSIVAMENTE pelo path external (ollamaChatWithTools
+ * com opcao mcpServers). O path local continua chamando executeLocalTool diretamente,
+ * sem passar por este dispatcher. Zero impacto no path local existente.
+ *
+ * @param toolName  - Nome da tool (ex: "Read", "mcp__google-drive__list_files")
+ * @param args      - Argumentos da tool
+ * @param cwd       - Diretorio de trabalho para tools de filesystem/shell
+ * @param mcpClient - Client MCP da sessao (presente quando mcpServers foi configurado)
+ */
+export async function executeToolDispatch(
+  toolName: string,
+  args: unknown,
+  cwd: string,
+  mcpClient?: McpSessionClient,
+): Promise<unknown> {
+  // Builtin primeiro (mais comum no path external tambem)
+  if (isBuiltinTool(toolName)) {
+    return executeLocalTool(toolName, args as Record<string, unknown>, cwd);
+  }
+
+  // MCP fallback: tool prefixada com mcp__
+  if (toolName.startsWith('mcp__')) {
+    if (!mcpClient) {
+      throw new Error(`executeToolDispatch: tool MCP "${toolName}" solicitada mas nenhum mcpClient disponivel`);
+    }
+    // Importacao lazy para evitar dependencia circular em tempo de carregamento
+    // (mcp-tool-bridge importa ollama-client para OllamaToolSchema)
+    const { callMCPTool } = await import('./mcp-tool-bridge');
+    return callMCPTool(mcpClient, toolName, args);
+  }
+
+  throw new Error(`executeToolDispatch: tool desconhecida "${toolName}". Builtin disponiveis: ${SUPPORTED_LOCAL_TOOLS.join(', ')}`);
+}

@@ -4,6 +4,7 @@ import { getSecret } from './secrets-vault';
 import { createLogger } from './logger';
 import type { MCPServerConfig } from '../../src/types';
 import { Readable } from 'stream';
+import { getAppVersion } from './app-version';
 
 const logger = createLogger('mcp');
 
@@ -389,7 +390,7 @@ export async function discoverAndSaveMCPTools(serverId: string): Promise<string[
       params: {
         protocolVersion: '2024-11-05',
         capabilities: {},
-        clientInfo: { name: 'lionclaw', version: '1.0.0' },
+        clientInfo: { name: 'lionclaw', version: getAppVersion() },
       },
     });
     proc.stdin?.write(initRequest + '\n');

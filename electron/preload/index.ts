@@ -1,7 +1,11 @@
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
-import type { LionClawAPI, StreamChunk, ConfirmAction, AskQuestionRequest, AskQuestionResponse, AuditEntry, PipelineStreamChunk, PipelinePhaseChangedEvent, PipelineNotesUpdatedEvent, PipelineSprintCompleteEvent, PipelineProjectUpdatedEvent, ChatAttachment } from '../../src/types';
+import type { LionClawAPI, StreamChunk, ConfirmAction, AskQuestionRequest, AskQuestionResponse, AuditEntry, PipelineStreamChunk, PipelinePhaseChangedEvent, PipelineNotesUpdatedEvent, PipelineSprintCompleteEvent, PipelineProjectUpdatedEvent, ChatAttachment, IngestionProgress, IngestJob, PipelineConversationPhases, PipelinePhaseArtifact } from '../../src/types';
+import type { PipelineAuditAgentProgressEvent, RepoManifest } from '../../src/types/pipeline';
 
 const api: LionClawAPI = {
+  app: {
+    getVersion: () => ipcRenderer.invoke('app:get-version'),
+  },
   chat: {
     send: (message, options) => ipcRenderer.invoke('chat:send', message, options),
     stop: () => ipcRenderer.invoke('chat:stop'),
@@ -127,9 +131,9 @@ const api: LionClawAPI = {
     exportJSON: (filters) => ipcRenderer.invoke('logs:export-json', filters),
   },
   tools: {
-    getSettings: () => ipcRenderer.invoke('tools:getSettings'),
-    setEnabled: (tool: string, enabled: boolean) => ipcRenderer.invoke('tools:setEnabled', tool, enabled),
-    getEnabled: () => ipcRenderer.invoke('tools:getEnabled'),
+    getSettings: () => ipcRenderer.invoke('tools:get-settings'),
+    setEnabled: (tool: string, enabled: boolean) => ipcRenderer.invoke('tools:set-enabled', tool, enabled),
+    getEnabled: () => ipcRenderer.invoke('tools:get-enabled'),
   },
   settings: {
     get: () => ipcRenderer.invoke('settings:get'),
@@ -150,11 +154,21 @@ const api: LionClawAPI = {
       return () => { ipcRenderer.removeListener('auth:locked', handler); };
     },
   },
-  usage: {
-    getStats: (filter) => ipcRenderer.invoke('usage:get-stats', filter || {}),
-    getSessionStats: (sessionId) => ipcRenderer.invoke('usage:get-session-stats', sessionId),
-    getAgentStats: (filter) => ipcRenderer.invoke('usage:get-agent-stats', filter || {}),
-    getTaskExecutions: (filter) => ipcRenderer.invoke('usage:get-task-executions', filter || {}),
+  codeburn: {
+    spawn: (cols, rows) => ipcRenderer.invoke('codeburn:spawn', { cols, rows }),
+    write: (data) => ipcRenderer.invoke('codeburn:write', data),
+    resize: (cols, rows) => ipcRenderer.invoke('codeburn:resize', { cols, rows }),
+    kill: () => ipcRenderer.invoke('codeburn:kill'),
+    onData: (cb: (chunk: string) => void) => {
+      const handler = (_: Electron.IpcRendererEvent, chunk: string) => cb(chunk);
+      ipcRenderer.on('codeburn:data', handler);
+      return () => { ipcRenderer.removeListener('codeburn:data', handler); };
+    },
+    onExit: (cb: (info: { exitCode: number; signal: number | null }) => void) => {
+      const handler = (_: Electron.IpcRendererEvent, info: { exitCode: number; signal: number | null }) => cb(info);
+      ipcRenderer.on('codeburn:exit', handler);
+      return () => { ipcRenderer.removeListener('codeburn:exit', handler); };
+    },
   },
   soul: {
     get: () => ipcRenderer.invoke('soul:get'),
@@ -180,6 +194,22 @@ const api: LionClawAPI = {
     set: (key: string, value: string) => ipcRenderer.invoke('vault:set', key, value),
     delete: (key: string) => ipcRenderer.invoke('vault:delete', key),
     check: (key: string) => ipcRenderer.invoke('vault:check', key),
+    registerAndSet: (
+      entry: {
+        key: string;
+        label: string;
+        description: string;
+        service: string;
+        required: boolean;
+        placeholder?: string;
+        docsUrl?: string;
+      },
+      value: string,
+    ) => ipcRenderer.invoke('vault:register-and-set', entry, value),
+  },
+  provider: {
+    testConnection: (providerName: string, baseUrl: string, apiKeyRef: string) =>
+      ipcRenderer.invoke('provider:test-connection', providerName, baseUrl, apiKeyRef),
   },
   image: {
     generate: (prompt: string, options?: { aspectRatio?: string }) =>
@@ -217,7 +247,7 @@ const api: LionClawAPI = {
     check: (baseUrl: string, model: string, provider?: string) =>
       ipcRenderer.invoke('ollama:check', baseUrl, model, provider),
     listModels: (provider: string, baseUrl: string) =>
-      ipcRenderer.invoke('ollama:listModels', provider, baseUrl),
+      ipcRenderer.invoke('ollama:list-models', provider, baseUrl),
   },
   knowledge: {
     upload: (payload: { agentId: string; filePath: string; config: { strategy: string; chunkSize: number; chunkOverlap: number; title?: string } }) =>
@@ -242,8 +272,8 @@ const api: LionClawAPI = {
       update: (payload: { agentId: string; config: Record<string, unknown> }) =>
         ipcRenderer.invoke('knowledge:config:update', payload),
     },
-    onIngestionProgress: (cb: (data: { sourceId: string; stage: string; progress: number }) => void) => {
-      const handler = (_: Electron.IpcRendererEvent, data: { sourceId: string; stage: string; progress: number }) => cb(data);
+    onIngestionProgress: (cb: (data: IngestionProgress) => void) => {
+      const handler = (_: Electron.IpcRendererEvent, data: IngestionProgress) => cb(data);
       ipcRenderer.on('knowledge:ingestion:progress', handler);
       return () => { ipcRenderer.removeListener('knowledge:ingestion:progress', handler); };
     },
@@ -305,58 +335,6 @@ const api: LionClawAPI = {
       return () => { ipcRenderer.removeListener('harness:error', handler); };
     },
   },
-  workflow: {
-    start: () => ipcRenderer.invoke('workflow:start'),
-    approve: (workflowRunId: string) => ipcRenderer.invoke('workflow:approve', workflowRunId),
-    cancel: (workflowRunId: string) => ipcRenderer.invoke('workflow:cancel', workflowRunId),
-    setUIActive: (active: boolean) => ipcRenderer.invoke('workflow:ui-active', active),
-    getActive: () => ipcRenderer.invoke('workflow:get-active'),
-    onActivated: (cb: (data: { workflowRunId: string; notesPath: string }) => void) => {
-      const handler = (_: Electron.IpcRendererEvent, data: { workflowRunId: string; notesPath: string }) => cb(data);
-      ipcRenderer.on('workflow:activated', handler);
-      return () => { ipcRenderer.removeListener('workflow:activated', handler); };
-    },
-    onStageChanged: (cb: (data: { stage: number }) => void) => {
-      const handler = (_: Electron.IpcRendererEvent, data: { stage: number }) => cb(data);
-      ipcRenderer.on('workflow:stage-changed', handler);
-      return () => { ipcRenderer.removeListener('workflow:stage-changed', handler); };
-    },
-    onStream: (cb: (data: { type: string; content?: string; tool?: string; error?: string }) => void) => {
-      const handler = (_: Electron.IpcRendererEvent, data: { type: string; content?: string; tool?: string; error?: string }) => cb(data);
-      ipcRenderer.on('workflow:stream', handler);
-      return () => { ipcRenderer.removeListener('workflow:stream', handler); };
-    },
-    onNotesUpdated: (cb: (data: { content: string; path: string }) => void) => {
-      const handler = (_: Electron.IpcRendererEvent, data: { content: string; path: string }) => cb(data);
-      ipcRenderer.on('workflow:notes-updated', handler);
-      return () => { ipcRenderer.removeListener('workflow:notes-updated', handler); };
-    },
-    onAgentStream: (cb: (data: { agent: string; msg: { type: string; content?: string; tool?: string } }) => void) => {
-      const handler = (_: Electron.IpcRendererEvent, data: { agent: string; msg: { type: string; content?: string; tool?: string } }) => cb(data);
-      ipcRenderer.on('workflow:agent-stream', handler);
-      return () => { ipcRenderer.removeListener('workflow:agent-stream', handler); };
-    },
-    onGenerationRound: (cb: (data: { round: number; max: number }) => void) => {
-      const handler = (_: Electron.IpcRendererEvent, data: { round: number; max: number }) => cb(data);
-      ipcRenderer.on('workflow:generation-round', handler);
-      return () => { ipcRenderer.removeListener('workflow:generation-round', handler); };
-    },
-    onGenerationDone: (cb: (data: { specPath: string; notesPath: string; passed: boolean }) => void) => {
-      const handler = (_: Electron.IpcRendererEvent, data: { specPath: string; notesPath: string; passed: boolean }) => cb(data);
-      ipcRenderer.on('workflow:generation-done', handler);
-      return () => { ipcRenderer.removeListener('workflow:generation-done', handler); };
-    },
-    onQuestionChanged: (cb: (data: { question: string; total: number; current: number }) => void) => {
-      const handler = (_: Electron.IpcRendererEvent, data: { question: string; total: number; current: number }) => cb(data);
-      ipcRenderer.on('workflow:question-changed', handler);
-      return () => { ipcRenderer.removeListener('workflow:question-changed', handler); };
-    },
-    onDiscoveryComplete: (cb: (data: { notesPath: string; notesContent: string }) => void) => {
-      const handler = (_: Electron.IpcRendererEvent, data: { notesPath: string; notesContent: string }) => cb(data);
-      ipcRenderer.on('workflow:discovery-complete', handler);
-      return () => { ipcRenderer.removeListener('workflow:discovery-complete', handler); };
-    },
-  },
   mgraph: {
     graph: () => ipcRenderer.invoke('mgraph:graph'),
     read: (path: string) => ipcRenderer.invoke('mgraph:read', path),
@@ -387,8 +365,8 @@ const api: LionClawAPI = {
     ingestAccept: (jobId: string) => ipcRenderer.invoke('mgraph:ingest-accept', jobId),
     ingestSettings: () => ipcRenderer.invoke('mgraph:ingest-settings'),
     ingestSettingsUpdate: (settings: Record<string, string>) => ipcRenderer.invoke('mgraph:ingest-settings-update', settings),
-    onIngestProgress: (cb: (data: unknown) => void) => {
-      const handler = (_: Electron.IpcRendererEvent, data: unknown) => cb(data);
+    onIngestProgress: (cb: (data: IngestJob) => void) => {
+      const handler = (_: Electron.IpcRendererEvent, data: IngestJob) => cb(data);
       ipcRenderer.on('mgraph:ingest-progress', handler);
       return () => { ipcRenderer.removeListener('mgraph:ingest-progress', handler); };
     },
@@ -451,6 +429,8 @@ const api: LionClawAPI = {
       ipcRenderer.invoke('pipeline:resume', projectId),
     send: (projectId: string, message: string, attachments?: ChatAttachment[]) =>
       ipcRenderer.invoke('pipeline:send', projectId, message, attachments),
+    getConversationPhases: () =>
+      ipcRenderer.invoke('pipeline:get-conversation-phases') as Promise<PipelineConversationPhases>,
     approve: (projectId: string, metadata?: Record<string, unknown>) =>
       ipcRenderer.invoke('pipeline:approve', projectId, metadata),
     getMetrics: (projectId: string) =>
@@ -459,6 +439,12 @@ const api: LionClawAPI = {
       ipcRenderer.invoke('pipeline:report', projectId),
     exportReport: (projectId: string, format: 'md') =>
       ipcRenderer.invoke('pipeline:export-report', projectId, format),
+    openProjectFile: (projectId: string, relativePath: string) =>
+      ipcRenderer.invoke('pipeline:open-project-file', { projectId, relativePath }) as Promise<{ ok: true } | { error: string }>,
+    openSmokeTest: (projectId: string) =>
+      ipcRenderer.invoke('pipeline:open-smoke-test', projectId) as Promise<{ ok: true } | { error: string }>,
+    getSmokeTestPath: (projectId: string) =>
+      ipcRenderer.invoke('pipeline:get-smoke-test-path', projectId) as Promise<{ exists: boolean; path?: string }>,
     decided: (projectId: string, blockId: string) =>
       ipcRenderer.invoke('pipeline:decided', projectId, blockId),
     conclude: (projectId: string) =>
@@ -467,8 +453,12 @@ const api: LionClawAPI = {
       ipcRenderer.invoke('pipeline:retry', projectId),
     confirmDevelopment: (projectId: string) =>
       ipcRenderer.invoke('pipeline:confirm-development', projectId),
-    createProject: (data: { name: string; description: string; projectPath: string; startPhase: number; specPath?: string; prdPath?: string }) =>
+    createProject: (data: { name: string; description: string; projectPath: string; startPhase: number; specPath?: string; prdPath?: string; pipelineType?: string }) =>
       ipcRenderer.invoke('pipeline:create-project', data),
+    getSecurityAgentStatus: (projectId: string) =>
+      ipcRenderer.invoke('pipeline:get-security-agent-status', projectId),
+    getAuditAgentsState: (projectId: string) =>
+      ipcRenderer.invoke('pipeline:get-audit-agents-state', projectId) as Promise<{ agents: Array<{ agentId: string; agentName: string; status: string; findingsCount?: number; costUsd: number; durationMs: number; model: string | null; startedAt?: string | null; completedAt?: string | null; toolCallsCount: number }> } | { error: string }>,
     deleteProject: (projectId: string) =>
       ipcRenderer.invoke('pipeline:delete-project', projectId),
     listProjects: () =>
@@ -536,7 +526,7 @@ const api: LionClawAPI = {
     getResetPreview: (projectId: string, target: { phase?: number; sprintIndex?: number }) =>
       ipcRenderer.invoke('pipeline:get-reset-preview', projectId, target),
     readPhaseArtifact: (projectId: string, phase: number) =>
-      ipcRenderer.invoke('pipeline:read-phase-artifact', projectId, phase),
+      ipcRenderer.invoke('pipeline:read-phase-artifact', projectId, phase) as Promise<PipelinePhaseArtifact>,
     getSprintHistory: (projectId: string, sprintIndex: number) =>
       ipcRenderer.invoke('pipeline:get-sprint-history', projectId, sprintIndex),
     listSprints: (projectId: string) =>
@@ -555,12 +545,77 @@ const api: LionClawAPI = {
         ipcRenderer.removeListener('pipeline:sprint-reset', handler2);
       };
     },
+    onSecurityAgentStatus: (cb: (data: { projectId: string; agentId: string; agentName: string; status: 'pending' | 'running' | 'completed' | 'failed'; findingsCount?: number; error?: string }) => void) => {
+      const handler = (_: Electron.IpcRendererEvent, data: { projectId: string; agentId: string; agentName: string; status: 'pending' | 'running' | 'completed' | 'failed'; findingsCount?: number; error?: string }) => cb(data);
+      ipcRenderer.on('pipeline:security-agent-status', handler);
+      return () => { ipcRenderer.removeListener('pipeline:security-agent-status', handler); };
+    },
+    onAuditAgentProgress: (cb: (event: PipelineAuditAgentProgressEvent) => void) => {
+      const handler = (_: Electron.IpcRendererEvent, event: PipelineAuditAgentProgressEvent) => cb(event);
+      ipcRenderer.on('pipeline:audit-agent-progress', handler);
+      return () => { ipcRenderer.removeListener('pipeline:audit-agent-progress', handler); };
+    },
+    readManifest: (projectId: string) =>
+      ipcRenderer.invoke('pipeline:read-manifest', projectId),
+    onManifest: (cb: (data: { projectId: string; manifest: RepoManifest }) => void) => {
+      const handler = (_: Electron.IpcRendererEvent, data: { projectId: string; manifest: RepoManifest }) => cb(data);
+      ipcRenderer.on('pipeline:manifest', handler);
+      return () => { ipcRenderer.removeListener('pipeline:manifest', handler); };
+    },
+    onResolutionTrackerComplete: (cb: (data: { projectId: string }) => void) => {
+      const handler = (_: Electron.IpcRendererEvent, data: { projectId: string }) => cb(data);
+      ipcRenderer.on('pipeline:resolution-tracker-complete', handler);
+      return () => { ipcRenderer.removeListener('pipeline:resolution-tracker-complete', handler); };
+    },
+    onStalled: (cb: (data: { projectId: string; phase: number; agentId: string; lastChunkAt: number; secondsSinceLastChunk: number }) => void) => {
+      const handler = (_: Electron.IpcRendererEvent, data: { projectId: string; phase: number; agentId: string; lastChunkAt: number; secondsSinceLastChunk: number }) => cb(data);
+      ipcRenderer.on('pipeline:stalled', handler);
+      return () => { ipcRenderer.removeListener('pipeline:stalled', handler); };
+    },
+    onAuthRequired: (cb: (data: { projectId: string; phaseNumber: number; agentId: string; message: string }) => void) => {
+      const handler = (_: Electron.IpcRendererEvent, data: { projectId: string; phaseNumber: number; agentId: string; message: string }) => cb(data);
+      ipcRenderer.on('pipeline:auth-required', handler);
+      return () => { ipcRenderer.removeListener('pipeline:auth-required', handler); };
+    },
+    resumeAfterAuth: (projectId: string) =>
+      ipcRenderer.invoke('pipeline:resume-after-auth', projectId) as Promise<{ ok: true } | { ok: false; message: string }>,
   },
   dialog: {
     openFile: (filters?: Array<{ name: string; extensions: string[] }>) =>
       ipcRenderer.invoke('dialog:open-file', { filters }) as Promise<string | null>,
     openDirectory: () =>
       ipcRenderer.invoke('dialog:open-directory') as Promise<string | null>,
+  },
+  codex: {
+    status: () => ipcRenderer.invoke('codex:status'),
+    test: () => ipcRenderer.invoke('codex:test'),
+    openLogin: () => ipcRenderer.invoke('codex:open-login'),
+    setBinaryPath: (path: string) => ipcRenderer.invoke('codex:set-binary-path', path),
+    // SPEC-codex-windows-fix.md Camada 2: fluxo de consent + prep Windows.
+    checkPrepNeeded: (projectPath: string) =>
+      ipcRenderer.invoke('codex:check-prep-needed', projectPath),
+    applyPrep: (repoRoot: string) =>
+      ipcRenderer.invoke('codex:apply-prep', repoRoot),
+    grantSkipConsent: (repoRoot: string) =>
+      ipcRenderer.invoke('codex:grant-consent', { repoRoot, action: 'skip' }),
+    // SPEC Camada 3: subscribe a warnings de pre-flight (canal proprio, NUNCA via stream do agente).
+    onWindowsHealthWarning: (handler: (payload: unknown) => void) => {
+      const wrapped = (_event: unknown, payload: unknown): void => handler(payload);
+      ipcRenderer.on('codex:windows-health-warning', wrapped);
+      return () => ipcRenderer.removeListener('codex:windows-health-warning', wrapped);
+    },
+    // SPEC Camada 4: subscribe a apply_patch failure threshold warnings.
+    onPatchFailureWarning: (handler: (payload: unknown) => void) => {
+      const wrapped = (_event: unknown, payload: unknown): void => handler(payload);
+      ipcRenderer.on('codex:patch-failure-warning', wrapped);
+      return () => ipcRenderer.removeListener('codex:patch-failure-warning', wrapped);
+    },
+    // SPEC Camada 2 Fluxo B: prep silencioso pulado (working tree sujo, etc).
+    onWindowsPrepSkipped: (handler: (payload: unknown) => void) => {
+      const wrapped = (_event: unknown, payload: unknown): void => handler(payload);
+      ipcRenderer.on('codex:windows-prep-skipped', wrapped);
+      return () => ipcRenderer.removeListener('codex:windows-prep-skipped', wrapped);
+    },
   },
 };
 

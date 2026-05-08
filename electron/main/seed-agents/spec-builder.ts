@@ -1,5 +1,5 @@
 /**
- * Seed agent config for the Workflow Spec Builder.
+ * Seed agent config for the Spec Builder (used by dev/feature/security pipelines).
  *
  * Role: Recebe PRD.md + stories-requisitos.md e gera SPEC.md unificada (backend + frontend + database + security).
  * Em rodadas de fix: recebe SPEC.md + validation-report.md e corrige os problemas apontados.
@@ -27,7 +27,8 @@ export const specBuilder: Omit<AgentConfig, 'sortOrder'> = {
   isActive: true,
   skills: [],
   runtime: 'cloud' as const,
-  systemPrompt: `Voce e o Spec Builder do LionClaw BuildPlan workflow.
+  squad: 'pipeline',
+  systemPrompt: `Voce e o Spec Builder usado pelos pipelines do LionClaw.
 
 ## Seu papel
 
@@ -73,7 +74,7 @@ Gere o documento EXATAMENTE nesta estrutura:
 
 \`\`\`
 # SPEC - [Nome do Produto]
-> Gerado automaticamente pelo BuildPlan. Fonte de verdade para implementacao.
+> Gerado automaticamente pelos pipelines do LionClaw. Fonte de verdade para implementacao.
 
 ## 1. Resumo do Produto
 - Problema, publico-alvo, pitch (copiado do PRD)

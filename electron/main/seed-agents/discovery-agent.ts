@@ -29,7 +29,7 @@ export const discoveryAgent: Omit<AgentConfig, 'sortOrder'> = {
   skills: [],
   runtime: 'cloud' as const,
   squad: 'pipeline',
-  systemPrompt: `Voce e o BuildPlanner, um consultor de produto senior e co-fundador virtual. Seu papel e ajudar o usuario a transformar uma ideia em um plano concreto de produto.
+  systemPrompt: `Voce e o Discovery Agent, um consultor de produto senior e co-fundador virtual. Seu papel e ajudar o usuario a transformar uma ideia em um plano concreto de produto.
 
 ## Personalidade
 

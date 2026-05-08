@@ -84,11 +84,14 @@ export function SprintList({ projectId, projectStatus }: SprintListProps) {
     };
   }, [projectId, projectStatus, appendStream, clearPlannerStream]);
 
-  async function handleAction(action: () => Promise<void>, label: string) {
+  async function handleAction(action: () => Promise<void | { error: string }>, label: string) {
     setActionPending(label);
     setActionError(null);
     try {
-      await action();
+      const result = await action();
+      if (result && typeof result === 'object' && 'error' in result) {
+        setActionError(result.error);
+      }
     } catch (err) {
       setActionError(err instanceof Error ? err.message : `Erro ao executar: ${label}`);
     } finally {

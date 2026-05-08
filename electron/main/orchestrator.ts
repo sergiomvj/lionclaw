@@ -3,36 +3,57 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { createLogger } from './logger';
-import { getAllAgents, getAgent, insertMessage, insertAuditEntry, createSession, getSetting, insertTokenUsage, updateSessionTokens, getActiveSession, getSession, getEnabledTools, getSessionMessages, insertTaskExecution } from './db';
+import { getAllAgents, getAgent, insertMessage, insertAuditEntry, createSession, getSetting, updateSessionTokens, getActiveSession, getActiveChatSession, getSession, getEnabledTools, getSessionMessages, insertTaskExecution } from './db';
 import { setActiveAgentId } from './knowledge-state';
 import { extractAndProcessOnboardingData } from './onboarding';
 import { calculateCost } from './pricing';
-import { getApiKey } from './secrets-vault';
+import { getApiKey, getSecret } from './secrets-vault';
 import { createPermissionGuard } from './permission-guard';
 import { getMCPConfigForAgent } from './mcp-manager';
 import { resolveAgentQueryConfig } from './agent-config-resolver';
 import { getDisabledSDKMcps } from './mcp-discovery';
 import { captureToolUse, captureToolResult, resetArtifactDetector } from './artifact-detector';
 import { buildSystemPrompt } from './prompt-builder';
-import { getAgentCwd, getLionClawHome } from './paths';
-import { getLocalAgentsDescription } from './local-agent-tools';
+import { getAgentCwd, getBackgroundCwd, getLionClawHome } from './paths';
+// codex-agents-mcp uses lazy initialization via dynamic import (the SDK is ESM-only).
+// We import the factory function statically but the server itself is built on first use.
+import { getCodexAgentsServer } from './codex-agents-mcp';
+import type { McpSdkServerConfigWithInstance } from '@anthropic-ai/claude-agent-sdk';
 import crypto from 'crypto';
 import type { StreamChunk, AuditEntry, AgentConfig, ArtifactData } from '../../src/types';
-import { generateSessionTitle } from './title-generator';
+import { ensureInitialSessionTitle, generateSessionTitle } from './title-generator';
 import { messageQueue } from './message-queue';
-import type { QueuedMessage } from './message-queue';
 
 const logger = createLogger('orchestrator');
 
-let currentAbortController: AbortController | null = null;
+// ---- SDK Lanes: independent subprocess state ----
+// Desktop lane: serves the main chat UI
+// Background lane: serves Telegram + Scheduler (isolated from desktop)
 
-// Flag em memoria: true quando o SDK tem a sessao carregada no processo atual.
-// Morre naturalmente quando o Electron reinicia.
-let sdkSessionAlive = false;
+interface SdkLane {
+  name: string;
+  sdkActiveSessionId: string | null;
+  currentAbortController: AbortController | null;
+}
 
-/** Reset SDK session state. Called by ipc-handlers after clearing session files. */
+const desktopLane: SdkLane = {
+  name: 'desktop',
+  sdkActiveSessionId: null,
+  currentAbortController: null,
+};
+
+const backgroundLane: SdkLane = {
+  name: 'background',
+  sdkActiveSessionId: null,
+  currentAbortController: null,
+};
+
+// Serializes background queries so Telegram and scheduler don't overlap
+let backgroundQueueChain: Promise<void> = Promise.resolve();
+
+/** Reset SDK session state for desktop lane. Called by ipc-handlers after clearing session files. */
 export function resetSdkSessionState(): void {
-  sdkSessionAlive = false;
+  desktopLane.sdkActiveSessionId = null;
 }
 
 // ---- Message Queue Integration ----
@@ -68,7 +89,7 @@ async function processQueue(getWindow: () => BrowserWindow | null): Promise<void
         { queueLength: messageQueue.length, message: item.message.substring(0, 80) },
         'Processing queued message',
       );
-      await executeQuery(item.message, item.options, getWindow);
+      await executeQuery(item.message, item.options, getWindow, desktopLane);
     }
   } finally {
     messageQueue.isProcessing = false;
@@ -76,9 +97,10 @@ async function processQueue(getWindow: () => BrowserWindow | null): Promise<void
 }
 
 async function buildAgentDefinitions(): Promise<Record<string, Record<string, unknown>>> {
-  // Only CLOUD agents become SDK subagents. Local agents are accessed via run_local_agent MCP tool.
+  // Only CLOUD agents become SDK subagents.
+  // Local agents → run_local_agent MCP tool. External agents → run_external_agent MCP tool.
   const agents = getAllAgents().filter(
-    (a: AgentConfig) => a.isActive && a.runtime !== 'local',
+    (a: AgentConfig) => a.isActive && a.runtime === 'cloud',
   );
   const definitions: Record<string, Record<string, unknown>> = {};
 
@@ -122,6 +144,7 @@ export async function executeQuery(
   message: string,
   options: QueryOptions,
   getWindow: () => BrowserWindow | null,
+  lane: SdkLane = desktopLane,
 ): Promise<void> {
   const apiKey = await getApiKey();
   if (!apiKey) {
@@ -134,7 +157,9 @@ export async function executeQuery(
   let shouldContinueSession = false;
 
   if (!sessionId) {
-    const activeSession = getActiveSession();
+    const activeSession = lane.name === 'desktop'
+      ? getActiveChatSession()
+      : getActiveSession();
 
     if (activeSession) {
       sessionId = activeSession.id;
@@ -169,7 +194,9 @@ export async function executeQuery(
 
   // Skip inserting user message on retry (already inserted in the first attempt)
   if (!options._forceNewSession) {
-    insertMessage(sessionId, 'user', options.displayMessage ?? message);
+    const visibleUserMessage = options.displayMessage ?? message;
+    insertMessage(sessionId, 'user', visibleUserMessage);
+    ensureInitialSessionTitle(sessionId, visibleUserMessage);
   }
 
   const agent = options.agentId ? getAllAgents().find((a) => a.id === options.agentId) : undefined;
@@ -188,7 +215,7 @@ export async function executeQuery(
   });
 
   const permissionGuard = createPermissionGuard(getWindow, { isOnboarding });
-  currentAbortController = new AbortController();
+  lane.currentAbortController = new AbortController();
 
   // Process image attachments
   let finalMessage = message;
@@ -217,9 +244,12 @@ export async function executeQuery(
   // Resolve MCP server config for this agent (or all active servers if no agentId)
   let mcpServers = await getMCPConfigForAgent(options.agentId);
 
-  // Auto-inject local-agents MCP server when any agent uses local runtime
-  const hasLocalAgent = getAllAgents().some((a: AgentConfig) => a.isActive && a.runtime === 'local');
-  if (hasLocalAgent) {
+  // Auto-inject local-agents MCP server when any agent uses local or external runtime
+  const allAgents = getAllAgents();
+  const hasLocalAgent = allAgents.some((a: AgentConfig) => a.isActive && a.runtime === 'local');
+  const hasExternalAgent = allAgents.some((a: AgentConfig) => a.isActive && a.runtime === 'external');
+
+  if (hasLocalAgent || hasExternalAgent) {
     const localAgentsPath = path.join(__dirname, '../../mcp-servers/local-agents/dist/index.js');
     const resolvedPath = fs.existsSync(localAgentsPath)
       ? localAgentsPath
@@ -227,12 +257,29 @@ export async function executeQuery(
 
     const lionclawHome = getLionClawHome();
 
+    // Resolve API keys for external agents and pass as env vars
+    const envVars: Record<string, string> = { LIONCLAW_HOME: lionclawHome };
+    if (hasExternalAgent) {
+      const externalAgents = allAgents.filter(
+        (a: AgentConfig) => a.isActive && a.runtime === 'external' && a.externalConfig,
+      );
+      const keyRefs = new Set<string>();
+      for (const agent of externalAgents) {
+        const ref = agent.externalConfig?.apiKeyRef;
+        if (ref) keyRefs.add(ref);
+      }
+      for (const ref of keyRefs) {
+        const value = await getSecret(ref);
+        if (value) envVars[ref] = value;
+      }
+    }
+
     if (mcpServers) {
       if (!mcpServers['local-agents']) {
         mcpServers['local-agents'] = {
           command: 'node',
           args: [resolvedPath],
-          env: { LIONCLAW_HOME: lionclawHome },
+          env: envVars,
         };
       }
     } else {
@@ -240,9 +287,23 @@ export async function executeQuery(
         'local-agents': {
           command: 'node',
           args: [resolvedPath],
-          env: { LIONCLAW_HOME: lionclawHome },
+          env: envVars,
         },
       };
+    }
+  }
+
+  // Auto-inject codex-agents in-process MCP server when any codex agent is active.
+  // Built lazily on first use because the SDK is ESM-only.
+  const hasCodexAgent = allAgents.some((a: AgentConfig) => a.isActive && a.runtime === 'codex');
+  if (hasCodexAgent) {
+    const codexServerConfig: McpSdkServerConfigWithInstance = await getCodexAgentsServer();
+    if (mcpServers) {
+      if (!mcpServers['codex-agents']) {
+        mcpServers['codex-agents'] = codexServerConfig;
+      }
+    } else {
+      mcpServers = { 'codex-agents': codexServerConfig };
     }
   }
 
@@ -291,10 +352,18 @@ export async function executeQuery(
     // Bridge variable between SubagentStart hook and task_started event
     let pendingAgentId: string | null = null;
 
+    /**
+     * EXCECAO D6 (SPEC-refactor-pipelines.md linhas 241-257):
+     * Chat orchestrator usa query() direto em vez de executeAgent porque tem
+     * necessidades próprias: fila de mensagens, subagent definitions, artifact
+     * detector, canUseTool customizado, calculateCost próprio.
+     *
+     * NÃO migrar para executeAgent.
+     */
     const q = query({
       prompt: finalMessage,
       options: {
-        cwd: getAgentCwd(isOnboarding),
+        cwd: lane === backgroundLane ? getBackgroundCwd() : getAgentCwd(isOnboarding),
         model,
         includePartialMessages: true,
         systemPrompt: isOnboarding
@@ -328,12 +397,12 @@ export async function executeQuery(
               },
             }
         ),
-        ...(shouldContinueSession && sdkSessionAlive
+        ...(shouldContinueSession && lane.sdkActiveSessionId === sessionId
           ? { continue: true }
-          : shouldContinueSession && !sdkSessionAlive
+          : shouldContinueSession
             ? { resume: sessionId }
             : { sessionId }),
-        abortController: currentAbortController,
+        abortController: lane.currentAbortController,
         ...(!isOnboarding && mcpServers ? { mcpServers } : {}),
       },
     });
@@ -777,7 +846,7 @@ export async function executeQuery(
     }
 
     // SDK session is now alive in this process: future messages can use continue: true
-    sdkSessionAlive = true;
+    lane.sdkActiveSessionId = sessionId;
 
     // Accumulate final turn
     totalInputTokens += turnInputTokens;
@@ -785,57 +854,9 @@ export async function executeQuery(
     totalCacheReadTokens += turnCacheReadTokens;
     totalCacheCreationTokens += turnCacheCreationTokens;
 
-    // Record token usage, separating main agent from subagents
+    // Update session-level token totals (drives the chat sidebar counter).
+    // token_usage table foi removida na V57; CodeBurn embed cobre o dashboard agora.
     if (totalInputTokens > 0 || totalOutputTokens > 0) {
-      // Calculate tokens consumed by subagents (those already recorded as task_executions)
-      let subagentInputTokens = 0;
-      let subagentOutputTokens = 0;
-      let subagentCacheReadTokens = 0;
-      let subagentCacheCreationTokens = 0;
-
-      // Sum up any remaining (not yet task_notification-completed) subagent entries
-      for (const entry of subagentTokens.values()) {
-        subagentInputTokens += entry.inputTokens;
-        subagentOutputTokens += entry.outputTokens;
-        subagentCacheReadTokens += entry.cacheReadTokens;
-        subagentCacheCreationTokens += entry.cacheCreationTokens;
-      }
-
-      // Main agent tokens = total minus subagent tokens
-      const mainInputTokens = Math.max(0, totalInputTokens - subagentInputTokens);
-      const mainOutputTokens = Math.max(0, totalOutputTokens - subagentOutputTokens);
-      const mainCacheReadTokens = Math.max(0, totalCacheReadTokens - subagentCacheReadTokens);
-      const mainCacheCreationTokens = Math.max(0, totalCacheCreationTokens - subagentCacheCreationTokens);
-
-      const cost = calculateCost(model, mainInputTokens, mainOutputTokens, mainCacheReadTokens, mainCacheCreationTokens);
-      insertTokenUsage({
-        sessionId,
-        model,
-        inputTokens: mainInputTokens,
-        outputTokens: mainOutputTokens,
-        cacheReadTokens: mainCacheReadTokens,
-        cacheCreationTokens: mainCacheCreationTokens,
-        costUsd: cost,
-        subagent: options.agentId,
-      });
-
-      // Record any remaining subagent entries that didn't receive task_notification
-      for (const [toolUseId, entry] of subagentTokens.entries()) {
-        const subCost = calculateCost(entry.model, entry.inputTokens, entry.outputTokens, entry.cacheReadTokens, entry.cacheCreationTokens);
-        insertTokenUsage({
-          sessionId,
-          model: entry.model,
-          inputTokens: entry.inputTokens,
-          outputTokens: entry.outputTokens,
-          cacheReadTokens: entry.cacheReadTokens,
-          cacheCreationTokens: entry.cacheCreationTokens,
-          costUsd: subCost,
-          subagent: entry.agentId ?? undefined,
-        });
-        logger.info({ toolUseId, agentId: entry.agentId, inputTokens: entry.inputTokens, outputTokens: entry.outputTokens }, 'Recorded orphaned subagent token_usage');
-      }
-
-      // updateSessionTokens uses the full total (includes all subagent costs already captured)
       const totalCost = calculateCost(model, totalInputTokens, totalOutputTokens, totalCacheReadTokens, totalCacheCreationTokens);
       updateSessionTokens(sessionId, totalInputTokens, totalOutputTokens, totalCost);
       sendSessionStream({
@@ -873,10 +894,12 @@ export async function executeQuery(
       if (session
         && session.type !== 'scheduled'
         && session.type !== 'telegram'
-        && !session.title
       ) {
         const msgs = getSessionMessages(session.id);
-        if (msgs.length >= 2) {
+        const assistantCount = msgs.filter((msg) => msg.role === 'assistant').length;
+        const shouldGenerateTitle = !session.title || assistantCount === 1;
+
+        if (shouldGenerateTitle && msgs.length >= 2) {
           generateSessionTitle(session.id).catch((err) => {
             logger.error({ err, sessionId }, 'Title generation failed');
           });
@@ -889,17 +912,17 @@ export async function executeQuery(
       return;
     }
     const errorMsg = error instanceof Error ? error.message : 'Erro desconhecido';
-    logger.error({ error, shouldContinueSession, sdkSessionAlive }, 'Orchestrator query failed');
+    logger.error({ error, shouldContinueSession, sdkActiveSessionId: lane.sdkActiveSessionId, lane: lane.name }, 'Orchestrator query failed');
 
     // If we were trying to resume/continue a session and it failed (EPIPE, subprocess crash),
     // retry once with a fresh SDK session. This preserves the resume feature for the main chat
     // while preventing infinite EPIPE loops when session files are missing/corrupted.
-    if (shouldContinueSession && !sdkSessionAlive) {
-      sdkSessionAlive = false;
+    if (shouldContinueSession && lane.sdkActiveSessionId !== sessionId) {
+      lane.sdkActiveSessionId = null;
       logger.warn({ sessionId }, 'Resume failed — retrying with fresh SDK session');
       try {
-        currentAbortController = null;
-        await executeQuery(message, { ...options, sessionId, _forceNewSession: true }, getWindow);
+        lane.currentAbortController = null;
+        await executeQuery(message, { ...options, sessionId, _forceNewSession: true }, getWindow, lane);
         return;
       } catch (retryErr) {
         const retryMsg = retryErr instanceof Error ? retryErr.message : 'Erro desconhecido';
@@ -918,7 +941,7 @@ export async function executeQuery(
 
     // Reset session state on any failure to avoid stale continue attempts
     if (shouldContinueSession) {
-      sdkSessionAlive = false;
+      lane.sdkActiveSessionId = null;
     }
 
     sendSessionStream({ type: 'error', error: errorMsg });
@@ -930,16 +953,16 @@ export async function executeQuery(
     insertAuditEntry(errorEntry);
     sendLogEntry(getWindow, errorEntry);
   } finally {
-    currentAbortController = null;
+    lane.currentAbortController = null;
   }
 }
 
 export function stopCurrentQuery(): void {
   // Clear the queue first so no pending messages are processed after abort
   messageQueue.clear();
-  if (currentAbortController) {
-    currentAbortController.abort();
-    currentAbortController = null;
+  if (desktopLane.currentAbortController) {
+    desktopLane.currentAbortController.abort();
+    desktopLane.currentAbortController = null;
   }
 }
 
@@ -977,4 +1000,35 @@ function sendLogEntry(
   } catch {
     // Render frame disposed (e.g. GPU crash, window reload)
   }
+}
+
+// ---- Background lane API (Telegram + Scheduler) ----
+
+/**
+ * Execute a query on the background lane, serialized.
+ * Telegram and Scheduler must use this instead of executeQuery directly
+ * to avoid interfering with the desktop chat subprocess.
+ */
+export function executeBackgroundQuery(
+  message: string,
+  options: QueryOptions,
+  getWindow: () => BrowserWindow | null,
+): Promise<void> {
+  backgroundQueueChain = backgroundQueueChain.then(() =>
+    executeQuery(message, options, getWindow, backgroundLane),
+  ).catch((err) => {
+    logger.error({ err }, 'Background query failed in chain');
+  });
+  return backgroundQueueChain;
+}
+
+export function stopBackgroundQuery(): void {
+  if (backgroundLane.currentAbortController) {
+    backgroundLane.currentAbortController.abort();
+    backgroundLane.currentAbortController = null;
+  }
+}
+
+export function resetBackgroundSessionState(): void {
+  backgroundLane.sdkActiveSessionId = null;
 }

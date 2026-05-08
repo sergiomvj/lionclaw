@@ -39,7 +39,10 @@ function formatCost(usd: number): string {
 
 function formatRuntime(runtime: string | null | undefined): string {
   if (!runtime) return 'cloud';
-  return runtime === 'local' ? 'local (Ollama)' : 'cloud';
+  if (runtime === 'local') return 'local (Ollama)';
+  if (runtime === 'external') return 'external (API)';
+  if (runtime === 'codex') return 'codex (OpenAI/OAuth)';
+  return 'cloud';
 }
 
 function statusEmoji(status: string): string {
@@ -226,18 +229,35 @@ function buildArtifactsSection(projectPath: string): string {
 function buildRuntimeSection(metrics: ReturnType<typeof getPipelineMetrics>): string {
   const { cloudCost, localCost, phases } = metrics;
   const hasLocal = phases.some((p) => p.runtime === 'local');
-  if (!hasLocal) return '';
+  const hasExternal = phases.some((p) => p.runtime === 'external');
+  const hasCodex = phases.some((p) => p.runtime === 'codex');
+  if (!hasLocal && !hasExternal && !hasCodex) return '';
 
-  let section = '## Cloud vs Local\n\n';
+  const externalCost = phases
+    .filter((p) => p.runtime === 'external')
+    .reduce((sum, p) => sum + p.costUsd, 0);
+  const codexCost = phases
+    .filter((p) => p.runtime === 'codex')
+    .reduce((sum, p) => sum + p.costUsd, 0);
+  // Cloud cost from db excludes only 'local'; recalculate to also exclude external and codex.
+  const trueCloudCost = cloudCost - externalCost - codexCost;
+
+  let section = '## Custo por Runtime\n\n';
   section += `| Runtime | Custo |\n`;
   section += `|---|---|\n`;
-  section += `| Cloud (Anthropic) | ${formatCost(cloudCost)} |\n`;
-  section += `| Local (Ollama) | ${formatCost(localCost)} |\n`;
+  section += `| Cloud (Anthropic) | ${formatCost(trueCloudCost)} |\n`;
+  if (hasLocal)     section += `| Local (Ollama) | ${formatCost(localCost)} |\n`;
+  if (hasExternal)  section += `| External (API) | ${formatCost(externalCost)} |\n`;
+  if (hasCodex)     section += `| Codex (OpenAI/OAuth) | ${formatCost(codexCost)} |\n`;
   section += '\n';
 
   const localPhases = phases.filter((p) => p.runtime === 'local');
   if (localPhases.length > 0) {
     section += `**Fases executadas localmente:** ${localPhases.map((p) => p.phaseName).join(', ')}\n`;
+  }
+  const codexPhases = phases.filter((p) => p.runtime === 'codex');
+  if (codexPhases.length > 0) {
+    section += `**Fases executadas via Codex:** ${codexPhases.map((p) => p.phaseName).join(', ')}\n`;
   }
 
   return section;

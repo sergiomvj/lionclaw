@@ -5,7 +5,6 @@ import remarkGfm from 'remark-gfm';
 import { useChatStore } from '@/stores/chat-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { useAppStore } from '@/stores/app-store';
-import { useWorkflowStore } from '@/stores/workflow-store';
 import { TokenCounter } from '@/components/chat/TokenCounter';
 import { ConfirmDialog } from '@/components/chat/ConfirmDialog';
 import { AskQuestionDialog } from '@/components/chat/AskQuestionDialog';
@@ -17,13 +16,7 @@ import { AudioPlayer } from '@/components/chat/AudioPlayer';
 import { SlashCommandPicker, type SlashCommand } from '@/components/chat/SlashCommandPicker';
 import type { ConfirmAction, AskQuestionRequest, AskQuestionResponse, ChatAttachment } from '@/types';
 
-const SLASH_COMMANDS: SlashCommand[] = [
-  {
-    command: '/BuildPlan',
-    label: 'BuildPlan',
-    description: 'Planejar um produto do zero com IA',
-  },
-];
+const SLASH_COMMANDS: SlashCommand[] = [];
 
 export function ChatPage() {
   const {
@@ -73,13 +66,7 @@ export function ChatPage() {
   }, [input]);
   const showSlashPicker = slashFilter !== null;
 
-  const [showBuildPlanConfirm, setShowBuildPlanConfirm] = useState(false);
-
   const handleSlashSelect = useCallback((command: string) => {
-    if (command === '/BuildPlan' && useWorkflowStore.getState().isActive) {
-      setShowBuildPlanConfirm(true);
-      return;
-    }
     clearDraft(sessionKey);
     setError(null);
     sendMessage(command);
@@ -570,37 +557,6 @@ export function ChatPage() {
           </p>
         </div>
       </div>
-
-      {/* BuildPlan confirmation dialog */}
-      {showBuildPlanConfirm && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
-          <div className="bg-zinc-900 border border-zinc-700 rounded-xl p-6 max-w-md mx-4 shadow-2xl">
-            <h3 className="text-sm font-semibold text-zinc-100 mb-2">Iniciar novo BuildPlan?</h3>
-            <p className="text-xs text-zinc-400 mb-5 leading-relaxed">
-              Ao criar um novo workflow voce cancelara o BuildPlan que esta em andamento. Todo o progresso anterior sera perdido.
-            </p>
-            <div className="flex justify-end gap-2">
-              <button
-                onClick={() => setShowBuildPlanConfirm(false)}
-                className="px-3 py-1.5 text-xs font-medium text-zinc-400 hover:text-zinc-200 bg-zinc-800 hover:bg-zinc-700 rounded-lg transition-colors"
-              >
-                Voltar
-              </button>
-              <button
-                onClick={() => {
-                  setShowBuildPlanConfirm(false);
-                  clearDraft(sessionKey);
-                  setError(null);
-                  sendMessage('/BuildPlan');
-                }}
-                className="px-3 py-1.5 text-xs font-medium text-white bg-orange-600 hover:bg-orange-500 rounded-lg transition-colors"
-              >
-                Confirmar
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
     </div>
   );

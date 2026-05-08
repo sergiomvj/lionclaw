@@ -14,7 +14,7 @@ export function getLionClawHome(): string {
 }
 
 /**
- * CWD para o subprocess do Agent SDK.
+ * CWD para o subprocess do Agent SDK (desktop lane).
  *
  * Sempre ~/.lionclaw — onde o CLAUDE.md gerado vive.
  * O SDK lê CLAUDE.md e .claude/ do CWD automaticamente.
@@ -23,4 +23,15 @@ export function getLionClawHome(): string {
  */
 export function getAgentCwd(_isOnboarding: boolean): string {
   return getLionClawHome();
+}
+
+/**
+ * CWD isolado para o background lane (Scheduler + Telegram).
+ *
+ * Usa ~/.lionclaw/background/ com seu proprio CLAUDE.md minimo.
+ * Isso garante que o SDK crie um subprocess SEPARADO do desktop,
+ * evitando que crons matem a sessao ativa do usuario.
+ */
+export function getBackgroundCwd(): string {
+  return path.join(getLionClawHome(), 'background');
 }

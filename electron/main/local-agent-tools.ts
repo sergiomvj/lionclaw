@@ -1,8 +1,5 @@
 import { getAllAgents } from './db';
-import { createLogger } from './logger';
 import type { AgentConfig } from '../../src/types';
-
-const logger = createLogger('local-tools-registry');
 
 /**
  * Gera texto descritivo dos agentes locais disponiveis pra incluir
@@ -34,5 +31,37 @@ export function getLocalAgentsDescription(): string {
   return `\n## Agentes Locais Disponiveis (via run_local_agent)\n\n` +
     `Use a tool run_local_agent para delegar tarefas a estes agentes locais.\n` +
     `Eles rodam em modelos locais (Ollama/LM Studio) na maquina, sem custo de API.\n\n` +
+    lines.join('\n') + '\n';
+}
+
+/**
+ * Gera texto descritivo dos agentes externos (OpenRouter, OpenAI, etc).
+ * O orquestrador usa essa info pra decidir quando chamar run_external_agent.
+ */
+export function getExternalAgentsDescription(): string {
+  const agents = getAllAgents().filter(
+    (a: AgentConfig) => a.isActive && a.runtime === 'external' && a.externalConfig,
+  );
+
+  if (agents.length === 0) return '';
+
+  const providerLabel: Record<string, string> = {
+    openrouter: 'OpenRouter',
+    openai: 'OpenAI',
+    'openai-compatible': 'Custom API',
+  };
+
+  const lines = agents.map((a) => {
+    const mode = a.localMode === 'smart' ? 'smart (com tools)' : 'simple (text-only)';
+    const tools = a.localMode === 'smart' && a.allowedTools.length > 0
+      ? ` | tools: ${a.allowedTools.join(', ')}`
+      : '';
+    const provider = providerLabel[a.externalConfig?.provider || 'openrouter'] || 'External';
+    return `  - agentId: "${a.id}" | nome: ${a.name} | ${a.description} | modo: ${mode} | provider: ${provider} | modelo: ${a.externalConfig?.model}${tools}`;
+  });
+
+  return `\n## Agentes Externos Disponiveis (via run_external_agent)\n\n` +
+    `Use a tool run_external_agent para delegar tarefas a estes agentes externos.\n` +
+    `Eles rodam em APIs externas (OpenRouter, OpenAI, etc) via HTTP.\n\n` +
     lines.join('\n') + '\n';
 }

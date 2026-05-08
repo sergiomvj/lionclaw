@@ -1,120 +1,13 @@
 import { BrowserWindow } from 'electron';
-import { createRequire } from 'module';
-import { execSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import { createLogger } from './logger';
 import { getLionClawHome } from './paths';
-import { getApiKey } from './secrets-vault';
-import { getMCPConfigForAgent } from './mcp-manager';
-import { processAgentStream } from './stream-processor';
-
-/**
- * Resolve the path to the Claude Code CLI executable.
- * The SDK normally resolves this via import.meta.url, but in Electron's
- * main process context the resolution can fail. We resolve it explicitly.
- */
-function getClaudeCodeExecutablePath(): string {
-  try {
-    const req = createRequire(import.meta.url);
-    const sdkEntry = req.resolve('@anthropic-ai/claude-agent-sdk');
-    return path.join(path.dirname(sdkEntry), 'cli.js');
-  } catch {
-    // Fallback: resolve from project root
-    const projectRoot = path.join(__dirname, '..', '..');
-    return path.join(projectRoot, 'node_modules', '@anthropic-ai', 'claude-agent-sdk', 'cli.js');
-  }
-}
-
-/**
- * Ensure the `node` binary is reachable from child processes.
- * In Electron, process.execPath is the Electron binary, not Node.js.
- * When Electron is launched from Finder/Dock (not terminal), `node` may
- * not be in PATH, causing spawn('node', ...) inside the SDK to ENOENT.
- * We find node's directory and prepend it to process.env.PATH.
- */
-let _nodePathFixed = false;
-function ensureNodeInPath(): void {
-  if (_nodePathFixed) return;
-  _nodePathFixed = true;
-
-  // Check if node is already reachable
-  try {
-    const cmd = process.platform === 'win32' ? 'where node' : 'which node';
-    const result = execSync(cmd, { encoding: 'utf-8', timeout: 3000 }).trim();
-    if (result) {
-      logger.info({ nodePath: result.split('\n')[0] }, 'node already in PATH');
-      return;
-    }
-  } catch {
-    // node not in PATH, fix it
-  }
-
-  // Search common installation paths
-  const commonPaths = process.platform === 'darwin'
-    ? [
-        '/usr/local/bin',
-        '/opt/homebrew/bin',
-        path.join(process.env.HOME ?? '', '.nvm/current/bin'),
-        '/usr/bin',
-      ]
-    : process.platform === 'win32'
-      ? [
-          'C:\\Program Files\\nodejs',
-          path.join(process.env.APPDATA ?? '', 'nvm\\current'),
-        ]
-      : ['/usr/bin', '/usr/local/bin'];
-
-  const nodeExe = process.platform === 'win32' ? 'node.exe' : 'node';
-  for (const dir of commonPaths) {
-    if (fs.existsSync(path.join(dir, nodeExe))) {
-      const sep = process.platform === 'win32' ? ';' : ':';
-      process.env.PATH = `${dir}${sep}${process.env.PATH ?? ''}`;
-      logger.info({ nodeDir: dir }, 'Prepended node directory to PATH');
-      return;
-    }
-  }
-
-  logger.warn('Could not find node binary in common paths');
-}
-/**
- * Ensure auth is available for the spawned CLI process.
- * Two auth methods are supported:
- * 1. OAuth via Claude Code login (~/.claude/) - uses the user's Claude subscription
- * 2. ANTHROPIC_API_KEY in env - uses API credits
- *
- * If the user has an API key in the Vault, inject it into process.env as fallback.
- * If not, rely on Claude Code OAuth (user must have run `claude login`).
- */
-async function ensureAuthForSDK(): Promise<void> {
-  // Already have API key in env? Nothing to do.
-  if (process.env.ANTHROPIC_API_KEY) {
-    logger.info('Auth: using ANTHROPIC_API_KEY from env');
-    return;
-  }
-
-  // Check if Claude Code OAuth is available
-  const claudeDir = path.join(process.env.HOME ?? '', '.claude');
-  if (fs.existsSync(claudeDir)) {
-    logger.info({ claudeDir }, 'Auth: found ~/.claude directory (OAuth likely available)');
-    // Don't inject API key - let CLI use OAuth
-    return;
-  }
-
-  // No OAuth found, try to inject API key from Vault as fallback
-  try {
-    const apiKey = await getApiKey();
-    if (apiKey) {
-      process.env.ANTHROPIC_API_KEY = apiKey;
-      logger.info('Auth: injected ANTHROPIC_API_KEY from Vault');
-      return;
-    }
-  } catch {
-    // getApiKey may fail if keytar is not available
-  }
-
-  logger.warn('Auth: no ANTHROPIC_API_KEY and no ~/.claude found. CLI may fail to authenticate. Run "claude login" or configure API key in Vault.');
-}
+import { extractJSON } from './json-extractor';
+import { ensureNodeInPath } from './pipeline-shared/sdk-bootstrap';
+import { emitIPC } from './pipeline-shared/ipc-emitter';
+import { setProjectStatus } from './pipeline-shared/status';
+import { persistMessage, persistHarnessRound } from './pipeline-shared/persist';
 
 import {
   getHarnessProject,
@@ -123,16 +16,11 @@ import {
   updateHarnessSprint,
   getAgent,
   getAllAgents,
-  insertHarnessRound,
-  updateHarnessRound,
   getDb,
   getEnrichSession,
   updateEnrichSession,
   accumulateEnrichMetrics,
-  insertEnrichMessage,
-  savePipelineMessage,
 } from './db';
-import { calculateCost } from './pricing';
 import {
   buildPlannerPrompt,
   buildPlannerMarkdownPrompt,
@@ -140,9 +28,9 @@ import {
   parsePlannerOutput,
   parsePlannerMarkdown,
   saveSprintsJson,
-  readLatestSprintsJson,
+  readHarnessSprintsJson,
 } from './harness-planner';
-import type { SprintJsonEntry } from './harness-planner';
+import type { SprintJsonEntry, SprintsJson } from './harness-planner';
 import {
   buildCoderPrompt,
   buildCoderFeedbackPrompt,
@@ -158,128 +46,173 @@ import {
   updateSpecProgress,
   buildFeedbackFromEvaluation,
 } from './harness-evaluator';
-import { setActiveEnrichSpecPath } from './permission-guard';
+import { setActiveEnrichSpecPath, createEnrichPermissionGuard } from './permission-guard';
+import { executeAgent } from './agent-runtime';
+import type { AgentExecutionResult } from './agent-runtime/types';
+import { PERM_BYPASS_NO_GUARD, PERM_DEFAULT_WITH_GUARD } from './agent-runtime/permission-profiles';
 import { ollamaChatWithTools } from './ollama-client';
-import type { OllamaToolSchema, LocalLLMProvider } from './ollama-client';
-import type { EvaluationResult, CreateEnrichConfig, EnrichPhase } from '../../src/types';
+import type { OllamaChatResult } from './ollama-client';
+import { getSecret } from './vault-registry';
+import type { EvaluationResult, CreateEnrichConfig, EnrichPhase, ExternalConfig, AgentConfig } from '../../src/types';
+import { runSmokeTest, writeSmokeTestReport } from './smoke-test-runner';
+import {
+  getPipelineDocsContext,
+  resolveSpecPath,
+  resolveSpecProgressPath,
+  resolveHarnessSprintsPath,
+} from './pipeline-paths';
+import { getArchitectureReviewContext } from './architecture-review-paths';
 
 const logger = createLogger('harness-engine');
 
+// ============================================================
+// Helpers para path external (Sprint 7)
+// Aplicam-se APENAS ao runtime 'external'. Cloud e local nao os usam.
+// ============================================================
+
 /**
- * Resolve mcpServers config for a harness agent query() call.
- * Uses the same function as the orchestrator (getMCPConfigForAgent)
- * which returns the Record<string, McpConfig> format that query() expects.
+ * Resolve os headers de autenticacao para um provider externo a partir do Vault.
+ * Chamado no inicio de CADA sprint (nao cacheado), conforme SPEC secao 3.5.2.
+ * Spread order: extraHeaders primeiro, Authorization por ultimo para garantir
+ * que extraHeaders nunca sobrescreva a Authorization resolvida (SPEC secao 6.2).
  */
-async function resolveMCPsForHarnessAgent(agentId: string): Promise<Record<string, { command: string; args: string[]; env?: Record<string, string> }> | undefined> {
-  return getMCPConfigForAgent(agentId);
-}
-
-// ---------------------------------------------------------------------------
-// Helper: convert builtin tool names to OllamaToolSchema for local runtime
-// ---------------------------------------------------------------------------
-
-function builtinToolsToOllamaSchemas(toolNames: string[]): OllamaToolSchema[] {
-  const SCHEMAS: Record<string, OllamaToolSchema> = {
-    Read: {
-      type: 'function',
-      function: {
-        name: 'Read',
-        description: 'Read the contents of a file from the filesystem.',
-        parameters: {
-          type: 'object',
-          properties: {
-            file_path: { type: 'string', description: 'Absolute path to the file.' },
-            offset: { type: 'number', description: 'Line offset (0-based).' },
-            limit: { type: 'number', description: 'Max lines to read.' },
-          },
-          required: ['file_path'],
-        },
-      },
-    },
-    Write: {
-      type: 'function',
-      function: {
-        name: 'Write',
-        description: 'Write content to a file, creating it if necessary.',
-        parameters: {
-          type: 'object',
-          properties: {
-            file_path: { type: 'string', description: 'Absolute path to the file.' },
-            content: { type: 'string', description: 'Content to write.' },
-          },
-          required: ['file_path', 'content'],
-        },
-      },
-    },
-    Edit: {
-      type: 'function',
-      function: {
-        name: 'Edit',
-        description: 'Replace a substring in a file with new content.',
-        parameters: {
-          type: 'object',
-          properties: {
-            file_path: { type: 'string', description: 'Absolute path to the file.' },
-            old_string: { type: 'string', description: 'Exact string to replace.' },
-            new_string: { type: 'string', description: 'Replacement string.' },
-          },
-          required: ['file_path', 'old_string', 'new_string'],
-        },
-      },
-    },
-    Glob: {
-      type: 'function',
-      function: {
-        name: 'Glob',
-        description: 'Find files matching a glob pattern.',
-        parameters: {
-          type: 'object',
-          properties: {
-            pattern: { type: 'string', description: 'Glob pattern to match.' },
-            path: { type: 'string', description: 'Base directory path.' },
-          },
-          required: ['pattern'],
-        },
-      },
-    },
-    Grep: {
-      type: 'function',
-      function: {
-        name: 'Grep',
-        description: 'Search for a regex pattern in files.',
-        parameters: {
-          type: 'object',
-          properties: {
-            pattern: { type: 'string', description: 'Regex pattern to search.' },
-            path: { type: 'string', description: 'Directory or file to search.' },
-            glob: { type: 'string', description: 'File glob filter.' },
-          },
-          required: ['pattern'],
-        },
-      },
-    },
-    Bash: {
-      type: 'function',
-      function: {
-        name: 'Bash',
-        description: 'Execute a shell command.',
-        parameters: {
-          type: 'object',
-          properties: {
-            command: { type: 'string', description: 'Shell command to execute.' },
-            timeout: { type: 'number', description: 'Timeout in milliseconds.' },
-          },
-          required: ['command'],
-        },
-      },
-    },
+export async function resolveExternalAuth(
+  config: ExternalConfig,
+): Promise<Record<string, string>> {
+  const apiKey = await getSecret(config.apiKeyRef);
+  if (!apiKey) {
+    throw new Error(
+      `API key nao encontrada no Vault para provider "${config.apiKeyRef}". ` +
+      `Configure em Configuracoes > Vault.`,
+    );
+  }
+  return {
+    ...(config.extraHeaders ?? {}),
+    'Authorization': `Bearer ${apiKey}`,
   };
-
-  return toolNames
-    .filter((n) => !n.startsWith('mcp__'))
-    .map((n) => SCHEMAS[n])
-    .filter((s): s is OllamaToolSchema => s !== undefined);
 }
+
+/**
+ * Wrapper com retry para HTTP 429 (Rate Limit) e HTTP 5xx (Gateway/Service errors).
+ * Aplica-se APENAS ao path external. Cloud e local nao usam.
+ *
+ * Comportamento:
+ *  - 429: usa Retry-After header quando presente, fallback de 30s.
+ *  - 5xx (502/503/504): backoff exponencial (2s, 4s, 8s, 16s, capped em 30s).
+ *  - Outros erros: relanca imediatamente sem retry.
+ *  - Max 5 retries (total de 6 tentativas).
+ */
+export async function ollamaChatWithRetry(
+  ...args: Parameters<typeof ollamaChatWithTools>
+): Promise<OllamaChatResult> {
+  const MAX_RETRIES = 5;
+  const DEFAULT_429_WAIT_MS = 30_000;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await ollamaChatWithTools(...args);
+    } catch (err) {
+      const errMsg = (err as Error).message || '';
+      const is429 = errMsg.includes('HTTP 429');
+      const is5xx = /HTTP 5\d\d/.test(errMsg);
+
+      if ((!is429 && !is5xx) || attempt === MAX_RETRIES) {
+        throw err;
+      }
+
+      let waitMs: number;
+      if (is429) {
+        const retryAfterMatch = errMsg.match(/Retry-After:\s*(\d+)/i);
+        waitMs = retryAfterMatch
+          ? parseInt(retryAfterMatch[1], 10) * 1000
+          : DEFAULT_429_WAIT_MS;
+      } else {
+        // Exponential backoff for 5xx: 2s, 4s, 8s, 16s, 30s.
+        waitMs = Math.min(2000 * Math.pow(2, attempt), 30_000);
+      }
+
+      logger.warn(
+        {
+          attempt: attempt + 1,
+          maxRetries: MAX_RETRIES,
+          waitMs,
+          statusType: is429 ? '429' : '5xx',
+          model: args[1],
+          errPreview: errMsg.substring(0, 200),
+        },
+        'External request failed, retrying',
+      );
+
+      await new Promise(r => setTimeout(r, waitMs));
+    }
+  }
+
+  throw new Error('Retry exhausted');
+}
+
+/**
+ * Computa a chave de pricing correta para o provider externo.
+ * OpenRouter usa prefixo "or:" para diferenciar dos precos OpenAI direto.
+ * SPEC secao 3.5.3.
+ */
+export function computePricingKey(extCfg: ExternalConfig): string {
+  if (extCfg.provider === 'openrouter') return `or:${extCfg.model}`;
+  return extCfg.model;
+}
+
+/**
+ * Mapeia os campos de effort/thinking do agente para params de reasoning
+ * especificos do provider externo. Os campos sao Claude SDK-specific e precisam
+ * de traducao por provider/modelo. SPEC secao 3.10.3.
+ */
+export function mapReasoningParams(
+  effort: AgentConfig['effort'] | undefined,
+  thinking: AgentConfig['thinking'] | undefined,
+  _thinkingBudget: number | undefined,
+  provider: ExternalConfig['provider'],
+  model: string,
+): Partial<Record<string, unknown>> {
+  // Clamp 'max' to 'high': OpenAI and OpenRouter only accept 'low' | 'medium' | 'high'
+  const reasoningEffort = effort === 'max' ? 'high' : (effort ?? 'medium');
+
+  // OpenAI GPT-5.5, o-series: reasoning_effort
+  if (provider === 'openai' && (model.startsWith('gpt-5.5') || model.startsWith('o'))) {
+    if (thinking === 'disabled') return {};
+    return { reasoning_effort: reasoningEffort };
+  }
+
+  // OpenRouter: passa adiante para o upstream baseado no slug do modelo
+  if (provider === 'openrouter') {
+    // GPT-5.5 via OpenRouter
+    if (model.startsWith('openai/gpt-5')) {
+      return thinking === 'disabled' ? {} : { reasoning_effort: reasoningEffort };
+    }
+    // Qwen 3.6 thinking mode
+    if (model.startsWith('qwen/qwen3.6') && thinking !== 'disabled') {
+      return { thinking: { type: 'enabled' } };
+    }
+    // Kimi K2 Thinking e DeepSeek-Reasoner: reasoning embutido no slug, sem param adicional
+  }
+
+  return {}; // outros providers/modelos: ignora
+}
+
+/**
+ * Detecta erros de contexto excedido em mensagens de erro de multiplos providers.
+ * Usado no catch do bloco external para emitir mensagem clara ao usuario.
+ * SPEC secao 5.5.
+ */
+export function isContextLengthError(errorMessage: string): boolean {
+  return /context.*(length|limit|exceed|too long)/i.test(errorMessage)
+    || /maximum.*tokens/i.test(errorMessage)
+    || /token.*limit.*exceeded/i.test(errorMessage)
+    || errorMessage.includes('context_length_exceeded');
+}
+
+// S1.0/P1.1: removidos resolveMCPsForHarnessAgent e builtinToolsToOllamaSchemas
+// — eram usados pelo switch manual de runtime nos 4 metodos planner/regen/coder/evaluator.
+// executeAgent agora resolve MCPs via resolveAgentQueryConfig e cada executor monta
+// seus tool schemas internamente (ollama-client para local/external, SDK pra cloud).
 
 interface HarnessState {
   status: 'idle' | 'planning' | 'running' | 'paused';
@@ -304,6 +237,8 @@ export interface SprintMetrics {
   durationMs: number;
   toolUses: number;
   apiRequests: number;
+  model: string | null;
+  runtime: 'cloud' | 'local' | 'external' | null;
 }
 
 export interface SprintResult {
@@ -312,6 +247,53 @@ export interface SprintResult {
   metrics: { coder: SprintMetrics; evaluator: SprintMetrics };
   coderMetrics: SprintMetrics;
   evaluatorMetrics: SprintMetrics;
+}
+
+function extractEvaluationJSON(
+  result: import('./json-extractor').ExtractJSONSource,
+  round: number,
+  sprintId: string,
+): { evaluation: EvaluationResult; tier: string } {
+  const { value, tier } = extractJSON<EvaluationResult>(result, {
+    parser: (text, outMeta) => parseEvaluationOutput(text, round, outMeta),
+    contextLabel: 'Evaluator',
+    round,
+    sprintId,
+  });
+  return { evaluation: value, tier };
+}
+
+/**
+ * S1.0/P1.1: mapeia o runtime que executou o agente para os campos de auditoria
+ * que vao para harness_rounds (cost_source, runtime_used).
+ *
+ * - cloud   -> sdk_anthropic (cost calculado pelo cloud-executor via calculateCost)
+ * - codex   -> reported (codex-executor reporta cost emitido pelo CLI)
+ * - local   -> calculated (local-executor calcula via calculateCost com pricing key)
+ * - external -> reported quando upstream entrega usage.cost, calculated caso contrario
+ *
+ * Como a coluna runtime_used no DB ainda esta tipada como
+ * 'cloud' | 'local' | 'external' | null (V44), 'codex' eh normalizado para
+ * 'cloud' aqui — o codex e funcionalmente cloud-backed via Anthropic API. Quando
+ * a coluna for ampliada (futura migration), trocar este map para passar 'codex'
+ * adiante.
+ */
+function mapRuntimeToCostMeta(
+  runtime: AgentExecutionResult['runtime'],
+): {
+  costSource: 'sdk_anthropic' | 'calculated' | 'reported' | 'fallback_zero';
+  runtimeUsed: 'cloud' | 'local' | 'external';
+} {
+  switch (runtime) {
+    case 'cloud':
+      return { costSource: 'sdk_anthropic', runtimeUsed: 'cloud' };
+    case 'codex':
+      return { costSource: 'reported', runtimeUsed: 'cloud' };
+    case 'local':
+      return { costSource: 'calculated', runtimeUsed: 'local' };
+    case 'external':
+      return { costSource: 'reported', runtimeUsed: 'external' };
+  }
 }
 
 export class HarnessEngine {
@@ -351,14 +333,10 @@ export class HarnessEngine {
     } catch {
       // Bridge target (PipelineEngine) window may have been destroyed
     }
-    try {
-      const win = this.getWindow();
-      if (win && !win.isDestroyed()) {
-        win.webContents.send(channel, data);
-      }
-    } catch {
-      // Render frame disposed (e.g. GPU crash, window reload)
-    }
+    // Direct window send is now delegated to the shared `emitIPC` helper
+    // (electron/main/pipeline-shared/ipc-emitter.ts). The bridge above is kept
+    // here because it is HarnessEngine-specific (forwards to PipelineEngine).
+    emitIPC(channel, data);
   }
 
   /**
@@ -494,17 +472,18 @@ export class HarnessEngine {
     const project = getHarnessProject(projectId);
     if (!project) throw new Error(`Project ${projectId} not found`);
 
-    updateHarnessProject(projectId, { status: 'planning' });
+    setProjectStatus(projectId, 'planning');
     this.emitIPC('harness:project-update', { projectId, status: 'planning' });
 
     const startedAt = Date.now();
 
     try {
-      // 1. Read spec content
-      if (!fs.existsSync(project.specPath)) {
-        throw new Error(`Spec file not found: ${project.specPath}`);
+      // 1. Read spec content (with fallback for legacy projects with empty spec_path).
+      const specPath = resolveSpecPath(project);
+      if (!fs.existsSync(specPath)) {
+        throw new Error(`Spec file not found: ${specPath}`);
       }
-      const specContent = fs.readFileSync(project.specPath, 'utf-8');
+      const specContent = fs.readFileSync(specPath, 'utf-8');
 
       // 2. Get planner agent config
       const plannerAgent = getAgent(project.config.plannerAgentId);
@@ -526,151 +505,130 @@ export class HarnessEngine {
         throw new Error(`Project path does not exist: ${project.projectPath}. Create the directory first.`);
       }
 
-      let fullOutput: string;
-      let inputTokens: number;
-      let outputTokens: number;
-      let cacheReadTokens: number;
-      let cacheCreationTokens: number;
+      // S1.0/P1.1: substituido o switch manual por executeAgent — despacho por
+      // runtime (cloud/codex/local/external) acontece dentro do agent-runtime.
+      // Para o cloud, executeAgent retorna accumulatedText/textBlocks que o
+      // extractJSON precisa para os tiers de fallback. Para os outros runtimes
+      // esses campos ficam undefined e o parsing cai no fullOutput direto.
+      logger.info(
+        { projectId, runtime: plannerAgent.runtime, model: plannerAgent.model, cwd: project.projectPath },
+        'Spawning Planner via executeAgent',
+      );
 
-      const plannerToolNames = ['Read', 'Glob', 'Grep', 'WebSearch'];
-
-      // ---- Local LLM path (Ollama / LM Studio / OpenAI-compatible) ----
-      if (plannerAgent.runtime === 'local' && plannerAgent.localConfig) {
-        const localCfg = plannerAgent.localConfig;
-        const localTools = builtinToolsToOllamaSchemas(plannerToolNames);
-
-        logger.info(
-          { projectId, provider: localCfg.provider, model: localCfg.model },
-          'Spawning Planner via local LLM',
-        );
-
-        const localResult = await ollamaChatWithTools(
-          localCfg.baseUrl,
-          localCfg.model,
-          plannerAgent.systemPrompt || '',
-          prompt,
-          localTools,
-          {
-            cwd: project.projectPath,
-            provider: (localCfg.provider || 'ollama') as LocalLLMProvider,
-            onText: (text) => {
-              this.emitIPC('harness:agent-stream', {
-                projectId,
-                agent: 'planner',
-                event: { type: 'text', content: text },
-              });
-            },
-            onToolUse: (record) => {
-              this.emitIPC('harness:agent-stream', {
-                projectId,
-                agent: 'planner',
-                event: { type: 'tool_use', tool: record.tool },
-              });
-            },
-          },
-        );
-
-        fullOutput = localResult.content;
-        inputTokens = localResult.promptTokens;
-        outputTokens = localResult.tokensUsed;
-        cacheReadTokens = 0;
-        cacheCreationTokens = 0;
-
-        logger.info('Planner finished (local)');
-      } else {
-        // ---- Cloud SDK path ----
-        const cliPath = getClaudeCodeExecutablePath();
-        if (!fs.existsSync(cliPath)) {
-          throw new Error(`Claude Agent SDK cli.js not found at ${cliPath}. Run npm install.`);
-        }
-
-        await ensureAuthForSDK();
-
-        logger.info({ cwd: project.projectPath, cliPath }, 'Spawning planner agent');
-
-        const { query } = await import('@anthropic-ai/claude-agent-sdk');
-
-        const plannerMcps = await resolveMCPsForHarnessAgent(project.config.plannerAgentId);
-        const q = query({
-          prompt,
-          options: {
-            pathToClaudeCodeExecutable: cliPath,
-            cwd: project.projectPath,
-            model: plannerAgent.model,
-            systemPrompt: plannerAgent.systemPrompt || '',
-            allowedTools: plannerToolNames,
-            permissionMode: 'bypassPermissions' as const,
-            allowDangerouslySkipPermissions: true,
-            includePartialMessages: true,
-            abortController: state.abortController,
-            ...(plannerMcps ? { mcpServers: plannerMcps } : {}),
-            stderr: (text: string) => {
-              logger.info({ stderr: text.substring(0, 500) }, 'Planner stderr');
-            },
-          },
-        });
-
-        logger.info('Planner query created, starting stream iteration...');
-
-        const { output: plannerOutput, metrics: planMetrics } = await processAgentStream(q, {
-          shouldAbort: () => state.abortController?.signal.aborted ?? false,
-          onText: (text) => {
-            this.emitIPC('harness:agent-stream', {
-              projectId,
-              agent: 'planner',
-              event: { type: 'text', content: text },
-            });
-          },
-          onThinking: (text) => {
-            this.emitIPC('harness:agent-stream', {
-              projectId,
-              agent: 'planner',
-              event: { type: 'thinking', content: text },
-            });
-          },
-          onToolUse: (toolName) => {
-            this.emitIPC('harness:agent-stream', {
-              projectId,
-              agent: 'planner',
-              event: { type: 'tool_use', tool: toolName },
-            });
-          },
-          onResult: (resultText) => {
-            logger.info({ outputLen: resultText.length }, 'Planner result received');
-            this.emitIPC('harness:agent-stream', {
-              projectId,
-              agent: 'planner',
-              event: { type: 'text', content: '\n[Planner concluiu - processando resultado...]\n' },
-            });
-          },
-        });
-
-        logger.info('Planner stream finished');
-
-        fullOutput = plannerOutput;
-        inputTokens = planMetrics.inputTokens;
-        outputTokens = planMetrics.outputTokens;
-        cacheReadTokens = planMetrics.cacheReadTokens;
-        cacheCreationTokens = planMetrics.cacheCreationTokens;
+      if (!state.abortController) {
+        state.abortController = new AbortController();
       }
+      const abortController = state.abortController;
+
+      const plannerResult = await executeAgent({
+        agentId: plannerAgent.id,
+        prompt,
+        cwd: project.projectPath,
+        abortController,
+        permission: PERM_BYPASS_NO_GUARD,
+        projectId,
+        onText: (text) => {
+          this.emitIPC('harness:agent-stream', {
+            projectId,
+            agent: 'planner',
+            event: { type: 'text', content: text },
+          });
+        },
+        onThinking: (text) => {
+          this.emitIPC('harness:agent-stream', {
+            projectId,
+            agent: 'planner',
+            event: { type: 'thinking', content: text },
+          });
+        },
+        onToolUse: (toolName) => {
+          this.emitIPC('harness:agent-stream', {
+            projectId,
+            agent: 'planner',
+            event: { type: 'tool_use', tool: toolName },
+          });
+        },
+      });
+
+      logger.info(
+        { projectId, runtime: plannerResult.runtime, model: plannerResult.model },
+        'Planner finished via executeAgent',
+      );
+
+      const fullOutput = plannerResult.output;
+      const inputTokens = plannerResult.metrics.inputTokens;
+      const outputTokens = plannerResult.metrics.outputTokens;
+      const cacheReadTokens = plannerResult.metrics.cacheReadTokens;
+      const cacheCreationTokens = plannerResult.metrics.cacheCreationTokens;
+      // Cloud-only fields used by extractJSON for fallback tiers (S1.0.4).
+      const plannerExtractSource: import('./json-extractor').ExtractJSONSource | undefined =
+        plannerResult.accumulatedText !== undefined && plannerResult.textBlocks !== undefined
+          ? {
+              output: fullOutput,
+              accumulatedText: plannerResult.accumulatedText,
+              textBlocks: plannerResult.textBlocks,
+            }
+          : undefined;
 
       if (state.abortController?.signal.aborted) {
-        updateHarnessProject(projectId, { status: 'failed' });
-        this.emitIPC('harness:project-update', { projectId, status: 'failed' });
+        // S3 (Onda 3): user-initiated abort during planning is NOT a failure.
+        // Pre-V48 the CHECK rejected 'aborted' so we wrote 'failed'. Pos-V48 we
+        // record the truth and the UI can distinguish abort from real errors.
+        setProjectStatus(projectId, 'aborted');
+        this.emitIPC('harness:project-update', { projectId, status: 'aborted' });
         state.status = 'idle';
         return;
       }
 
       // 7. Parse planner output (JSON or Markdown based on config)
+      // TODO: parsePRDValidator / parseSprintValidator not yet extracted as named functions
+      let plannerParseTier: string | null = null;
       const sprintsJson = outputFormat === 'markdown'
         ? parsePlannerMarkdown(fullOutput, project)
-        : parsePlannerOutput(fullOutput);
+        : (() => {
+            if (plannerExtractSource) {
+              const { value, tier } = extractJSON<SprintsJson>(plannerExtractSource, {
+                parser: (text, outMeta) => parsePlannerOutput(text, outMeta),
+                contextLabel: 'Planner',
+              });
+              plannerParseTier = tier;
+              return value;
+            }
+            // Fallback: local/external/codex path - only raw output available
+            const meta: { repaired?: boolean } = {};
+            const value = parsePlannerOutput(fullOutput, meta);
+            plannerParseTier = meta.repaired ? 'jsonrepair' : 'result';
+            return value;
+          })();
 
-      // 8. Save sprints.json + create DB sprint records
-      const projectDir = this.getProjectDir(projectId);
+      if (plannerParseTier && plannerParseTier !== 'result') {
+        logger.info({ projectId, plannerParseTier }, 'Planner JSON extracted from fallback tier');
+      }
+
+      // 8. Save sprints.json no path canonical do projeto-alvo (NAO mais ~/.lionclaw/...).
+      // Refactor que migrou sprints pra dentro do projeto-alvo ja foi aplicado em readers
+      // (pipeline-engine.findHarnessSprintsReadPath, sprint-validator). O writer ficou pra
+      // tras usando getProjectDir() legado, que retornava DIRETORIO em vez de FILE -> EISDIR.
+      // Ver BUGFIXTESTESV1.md Bug #8.
+      const projectFull = getHarnessProject(projectId);
+      if (!projectFull) throw new Error(`Project ${projectId} not found when resolving sprints path`);
+      // Architecture-review pipeline writes sprints inside the run dir
+      // (`<runDir>/sprints-<runId>.json`) so the manifest paths and reset map
+      // stay coherent. Other pipelines fall back to the legacy resolver
+      // (`docs/sprints.json` or `docs/Docs<id>/sprints<id>.json`).
+      let sprintsFilePath: string;
+      if (projectFull.pipelineType === 'architecture-review') {
+        const ctx = getArchitectureReviewContext(projectFull);
+        if (!ctx) {
+          throw new Error('architecture-review run context missing when planner ran — fase 1 must have generated runId');
+        }
+        sprintsFilePath = ctx.sprintsPath;
+      } else {
+        sprintsFilePath = resolveHarnessSprintsPath(projectFull);
+      }
       const { path: sprintsPath } = saveSprintsJson(
         projectId,
-        projectDir,
+        sprintsFilePath,
         sprintsJson,
         project.config.evaluatorAgentId,
         outputFormat,
@@ -693,15 +651,13 @@ export class HarnessEngine {
         version: sprintsJson.metadata.version,
       });
 
-      // 11. Track planner metrics directly on the project record
+      // 11. Track planner metrics directly on the project record.
+      // S1.0/P1.1: usa o costUsd ja calculado pelo executor (D6 — orchestrator
+      // segue calculando localmente, harness/pipeline/enrich nao). Recalcular
+      // aqui causaria double-count e diverge do que cloud/local/external/codex
+      // reportam internamente (cada runtime tem sua logica de pricing).
       const durationMs = Date.now() - startedAt;
-      const costUsd = calculateCost(
-        plannerAgent.model,
-        inputTokens,
-        outputTokens,
-        cacheReadTokens,
-        cacheCreationTokens,
-      );
+      const costUsd = plannerResult.metrics.costUsd;
 
       updateHarnessProject(projectId, {
         plannerInputTokens: inputTokens,
@@ -720,7 +676,7 @@ export class HarnessEngine {
 
     } catch (err) {
       logger.error({ err, projectId }, 'Planning failed');
-      updateHarnessProject(projectId, { status: 'failed' });
+      setProjectStatus(projectId, 'failed');
       this.emitIPC('harness:project-update', { projectId, status: 'failed' });
       this.emitIPC('harness:error', { projectId, error: (err as Error).message });
       throw err;
@@ -740,24 +696,24 @@ export class HarnessEngine {
     const project = getHarnessProject(projectId);
     if (!project) throw new Error(`Project ${projectId} not found`);
 
-    updateHarnessProject(projectId, { status: 'planning' });
+    setProjectStatus(projectId, 'planning');
     this.emitIPC('harness:project-update', { projectId, status: 'planning' });
 
     const startedAt = Date.now();
 
     try {
-      // 1. Read current sprints.json
-      const projectDir = this.getProjectDir(projectId);
-      const previousJson = readLatestSprintsJson(projectDir);
+      // 1. Read current sprints.json (canonical path no projeto-alvo). Ver Bug #8.
+      const previousJson = readHarnessSprintsJson(project);
       if (!previousJson) {
         throw new Error('No existing sprints.json found to regenerate from');
       }
 
-      // 2. Read spec content
-      if (!fs.existsSync(project.specPath)) {
-        throw new Error(`Spec file not found: ${project.specPath}`);
+      // 2. Read spec content (with fallback for legacy projects with empty spec_path).
+      const specPath = resolveSpecPath(project);
+      if (!fs.existsSync(specPath)) {
+        throw new Error(`Spec file not found: ${specPath}`);
       }
-      const specContent = fs.readFileSync(project.specPath, 'utf-8');
+      const specContent = fs.readFileSync(specPath, 'utf-8');
 
       // 3. Build regeneration prompt
       const plannerAgent = getAgent(project.config.plannerAgentId);
@@ -774,92 +730,50 @@ export class HarnessEngine {
         throw new Error(`Project path does not exist: ${project.projectPath}`);
       }
 
-      let fullOutput: string;
-      let inputTokens: number;
-      let outputTokens: number;
-      let cacheReadTokens: number;
-      let cacheCreationTokens: number;
+      // S1.0/P1.1: substituido o switch manual por executeAgent. Shape FLAT do
+      // regenerate preservado por compat historica (snapshot test). O callback
+      // onRawEvent (sdk_event) foi removido: nenhum subscriber no renderer.
+      logger.info(
+        { projectId, runtime: plannerAgent.runtime, model: plannerAgent.model },
+        'Spawning Planner (regen) via executeAgent',
+      );
 
-      const replanToolNames = ['Read', 'Glob', 'Grep', 'WebSearch'];
-
-      // ---- Local LLM path ----
-      if (plannerAgent.runtime === 'local' && plannerAgent.localConfig) {
-        const localCfg = plannerAgent.localConfig;
-        const localTools = builtinToolsToOllamaSchemas(replanToolNames);
-
-        const localResult = await ollamaChatWithTools(
-          localCfg.baseUrl,
-          localCfg.model,
-          plannerAgent.systemPrompt || '',
-          prompt,
-          localTools,
-          {
-            cwd: project.projectPath,
-            provider: (localCfg.provider || 'ollama') as LocalLLMProvider,
-            onText: (text) => {
-              this.emitIPC('harness:agent-stream', { projectId, agent: 'planner', type: 'text', content: text });
-            },
-          },
-        );
-
-        fullOutput = localResult.content;
-        inputTokens = localResult.promptTokens;
-        outputTokens = localResult.tokensUsed;
-        cacheReadTokens = 0;
-        cacheCreationTokens = 0;
-      } else {
-        // ---- Cloud SDK path ----
-        const cliPath = getClaudeCodeExecutablePath();
-        await ensureAuthForSDK();
-
-        const { query } = await import('@anthropic-ai/claude-agent-sdk');
-
-        const replanMcps = await resolveMCPsForHarnessAgent(project.config.plannerAgentId);
-        const q = query({
-          prompt,
-          options: {
-            pathToClaudeCodeExecutable: cliPath,
-            cwd: project.projectPath,
-            model: plannerAgent.model,
-            systemPrompt: plannerAgent.systemPrompt || '',
-            allowedTools: replanToolNames,
-            permissionMode: 'bypassPermissions' as const,
-            allowDangerouslySkipPermissions: true,
-            includePartialMessages: true,
-            abortController: state.abortController,
-            ...(replanMcps ? { mcpServers: replanMcps } : {}),
-          },
-        });
-
-        const { output: replanOutput, metrics: regenMetrics } = await processAgentStream(q, {
-          shouldAbort: () => state.abortController?.signal.aborted ?? false,
-          onText: (text) => {
-            this.emitIPC('harness:agent-stream', {
-              projectId,
-              agent: 'planner',
-              type: 'text',
-              content: text,
-            });
-          },
-          onRawEvent: (event) => {
-            this.emitIPC('harness:agent-stream', {
-              projectId,
-              agent: 'planner',
-              type: 'sdk_event',
-              event,
-            });
-          },
-        });
-
-        fullOutput = replanOutput;
-        inputTokens = regenMetrics.inputTokens;
-        outputTokens = regenMetrics.outputTokens;
-        cacheReadTokens = regenMetrics.cacheReadTokens;
-        cacheCreationTokens = regenMetrics.cacheCreationTokens;
+      if (!state.abortController) {
+        state.abortController = new AbortController();
       }
+      const regenAbortController = state.abortController;
+
+      const regenResult = await executeAgent({
+        agentId: plannerAgent.id,
+        prompt,
+        cwd: project.projectPath,
+        abortController: regenAbortController,
+        permission: PERM_BYPASS_NO_GUARD,
+        projectId,
+        onText: (text) => {
+          this.emitIPC('harness:agent-stream', { projectId, agent: 'planner', type: 'text', content: text });
+        },
+        onToolUse: (toolName) => {
+          this.emitIPC('harness:agent-stream', { projectId, agent: 'planner', type: 'tool_use', tool: toolName });
+        },
+      });
+
+      const fullOutput = regenResult.output;
+      const inputTokens = regenResult.metrics.inputTokens;
+      const outputTokens = regenResult.metrics.outputTokens;
+      const cacheReadTokens = regenResult.metrics.cacheReadTokens;
+      const cacheCreationTokens = regenResult.metrics.cacheCreationTokens;
+      const regenExtractSource: import('./json-extractor').ExtractJSONSource | undefined =
+        regenResult.accumulatedText !== undefined && regenResult.textBlocks !== undefined
+          ? {
+              output: fullOutput,
+              accumulatedText: regenResult.accumulatedText,
+              textBlocks: regenResult.textBlocks,
+            }
+          : undefined;
 
       if (state.abortController?.signal.aborted) {
-        updateHarnessProject(projectId, { status: 'reviewing' });
+        setProjectStatus(projectId, 'reviewing');
         this.emitIPC('harness:project-update', { projectId, status: 'reviewing' });
         state.status = 'idle';
         return;
@@ -871,12 +785,34 @@ export class HarnessEngine {
       db.prepare('DELETE FROM harness_sprints WHERE project_id = ?').run(projectId);
 
       // 6. Parse and save new version
+      // TODO: parsePRDValidator / parseSprintValidator not yet extracted as named functions
+      let regenParseTier: string | null = null;
       const sprintsJson = regenFormat === 'markdown'
         ? parsePlannerMarkdown(fullOutput, project)
-        : parsePlannerOutput(fullOutput);
+        : (() => {
+            if (regenExtractSource) {
+              const { value, tier } = extractJSON<SprintsJson>(regenExtractSource, {
+                parser: (text, outMeta) => parsePlannerOutput(text, outMeta),
+                contextLabel: 'Planner',
+              });
+              regenParseTier = tier;
+              return value;
+            }
+            // Fallback: local/external/codex path - only raw output available
+            const meta: { repaired?: boolean } = {};
+            const value = parsePlannerOutput(fullOutput, meta);
+            regenParseTier = meta.repaired ? 'jsonrepair' : 'result';
+            return value;
+          })();
+
+      if (regenParseTier && regenParseTier !== 'result') {
+        logger.info({ projectId, regenParseTier }, 'Regen planner JSON extracted from fallback tier');
+      }
+      // Salva no canonical do projeto-alvo (mesma logica do plan()). Ver Bug #8.
+      const sprintsFilePath = resolveHarnessSprintsPath(project);
       const { path: sprintsPath } = saveSprintsJson(
         projectId,
-        projectDir,
+        sprintsFilePath,
         sprintsJson,
         project.config.evaluatorAgentId,
         regenFormat,
@@ -901,13 +837,8 @@ export class HarnessEngine {
       });
 
       const durationMs = Date.now() - startedAt;
-      const costUsd = calculateCost(
-        plannerAgent.model,
-        inputTokens,
-        outputTokens,
-        cacheReadTokens,
-        cacheCreationTokens,
-      );
+      // S1.0/P1.1: usa o costUsd ja calculado pelo executor (D6).
+      const costUsd = regenResult.metrics.costUsd;
 
       // Accumulate planner metrics (add to existing since regeneration is an additional cost)
       const existingProject = getHarnessProject(projectId);
@@ -928,7 +859,7 @@ export class HarnessEngine {
 
     } catch (err) {
       logger.error({ err, projectId }, 'Regeneration failed');
-      updateHarnessProject(projectId, { status: 'failed' });
+      setProjectStatus(projectId, 'failed');
       this.emitIPC('harness:project-update', { projectId, status: 'failed' });
       this.emitIPC('harness:error', { projectId, error: (err as Error).message });
       throw err;
@@ -954,6 +885,10 @@ export class HarnessEngine {
     output: string;
     toolCallsAccum: Array<{ tool: string; input: unknown }>;
     promptUsed: string;
+    costSource: 'sdk_anthropic' | 'calculated' | 'reported' | 'fallback_zero';
+    runtimeUsed: 'cloud' | 'local' | 'external';
+    providerUsed: string;
+    modelUsed: string;
   }> {
     const project = getHarnessProject(projectId);
     if (!project) throw new Error(`Project ${projectId} not found`);
@@ -965,7 +900,7 @@ export class HarnessEngine {
     if (!coderAgent) throw new Error(`Coder agent not found: ${coderAgentId}`);
 
     // 2. Read SPEC_PROGRESS.md (empty string if first sprint)
-    const specProgressPath = path.join(project.projectPath, 'SPEC_PROGRESS.md');
+    const specProgressPath = resolveSpecProgressPath(project);
     const specProgressContent = fs.existsSync(specProgressPath)
       ? fs.readFileSync(specProgressPath, 'utf-8')
       : '';
@@ -986,87 +921,27 @@ export class HarnessEngine {
     // Accumulate tool calls for pipeline_messages persistence
     const coderToolCallsAccum: Array<{ tool: string; input: unknown }> = [];
 
-    // ---- Local LLM path (Ollama / LM Studio / OpenAI-compatible) ----
-    if (coderAgent.runtime === 'local' && coderAgent.localConfig) {
-      const localCfg = coderAgent.localConfig;
-      const localTools = builtinToolsToOllamaSchemas(coderAgent.allowedTools);
+    // S1.0/P1.1: substituido o switch manual por executeAgent — despacho por
+    // runtime (cloud/codex/local/external) acontece dentro do agent-runtime.
+    // Stream events mantem o NESTED shape ({ projectId, sprintId, round, agent, event })
+    // por compat com o subscriber em ExecutionView/SprintList.
+    logger.info(
+      { projectId, sprintId: sprint.id, round, runtime: coderAgent.runtime, model: coderAgent.model },
+      'Spawning Coder via executeAgent',
+    );
 
-      logger.info(
-        { projectId, sprintId: sprint.id, round, provider: localCfg.provider, model: localCfg.model },
-        'Spawning Coder via local LLM',
-      );
-
-      const localResult = await ollamaChatWithTools(
-        localCfg.baseUrl,
-        localCfg.model,
-        coderAgent.systemPrompt || '',
-        prompt,
-        localTools,
-        {
-          cwd: project.projectPath,
-          provider: (localCfg.provider || 'ollama') as LocalLLMProvider,
-          onText: (text) => {
-            const evt = { type: 'text', content: text };
-            this.emitIPC('harness:agent-stream', { projectId, sprintId: sprint.id, round, agent: 'coder', event: evt });
-            this.persistStreamEvent(projectId, sprint.id, round, 'coder', evt);
-          },
-          onToolUse: (record) => {
-            const evt = { type: 'tool_call', tool: record.tool };
-            this.emitIPC('harness:agent-stream', { projectId, sprintId: sprint.id, round, agent: 'coder', event: evt });
-            this.persistStreamEvent(projectId, sprint.id, round, 'coder', evt);
-            coderToolCallsAccum.push({ tool: record.tool, input: record.input ?? {} });
-          },
-        },
-      );
-
-      const durationMs = Date.now() - startedAt;
-      const costUsd = calculateCost(localCfg.model, localResult.promptTokens, localResult.tokensUsed, 0, 0);
-
-      logger.info(
-        { projectId, sprintId: sprint.id, round, durationMs, costUsd, toolUses: localResult.toolCalls.length, runtime: 'local' },
-        'Coder finished (local)',
-      );
-
-      return {
-        inputTokens: localResult.promptTokens,
-        outputTokens: localResult.tokensUsed,
-        cacheTokens: 0,
-        costUsd,
-        durationMs,
-        toolUses: localResult.toolCalls.length,
-        apiRequests: 1,
-        output: localResult.content,
-        toolCallsAccum: coderToolCallsAccum,
-        promptUsed: prompt,
-      };
+    if (!state.abortController) {
+      state.abortController = new AbortController();
     }
+    const coderAbortController = state.abortController;
 
-    // ---- Cloud SDK path ----
-    const cliPath = getClaudeCodeExecutablePath();
-    await ensureAuthForSDK();
-
-    const { query } = await import('@anthropic-ai/claude-agent-sdk');
-
-    const coderMcps = await resolveMCPsForHarnessAgent(coderAgentId);
-
-    const q = query({
+    const coderResult = await executeAgent({
+      agentId: coderAgent.id,
       prompt,
-      options: {
-        pathToClaudeCodeExecutable: cliPath,
-        cwd: project.projectPath,
-        model: coderAgent.model,
-        systemPrompt: coderAgent.systemPrompt || '',
-        allowedTools: coderAgent.allowedTools,
-        permissionMode: 'bypassPermissions' as const,
-        allowDangerouslySkipPermissions: true,
-        includePartialMessages: true,
-        abortController: state.abortController ?? undefined,
-        ...(coderMcps ? { mcpServers: coderMcps } : {}),
-      },
-    });
-
-    const { output: fullOutput, metrics: coderMetrics } = await processAgentStream(q, {
-      shouldAbort: () => state.abortController?.signal.aborted ?? false,
+      cwd: project.projectPath,
+      abortController: coderAbortController,
+      permission: PERM_BYPASS_NO_GUARD,
+      projectId,
       onText: (text) => {
         const evt = { type: 'text', content: text };
         this.emitIPC('harness:agent-stream', { projectId, sprintId: sprint.id, round, agent: 'coder', event: evt });
@@ -1076,35 +951,44 @@ export class HarnessEngine {
         const evt = { type: 'tool_call', tool: toolName };
         this.emitIPC('harness:agent-stream', { projectId, sprintId: sprint.id, round, agent: 'coder', event: evt });
         this.persistStreamEvent(projectId, sprint.id, round, 'coder', evt);
-        coderToolCallsAccum.push({ tool: toolName, input: {} });
+      },
+      onToolUseComplete: (toolName, input) => {
+        coderToolCallsAccum.push({ tool: toolName, input: input ?? {} });
       },
     });
 
     const durationMs = Date.now() - startedAt;
-    const costUsd = calculateCost(
-      coderAgent.model,
-      coderMetrics.inputTokens,
-      coderMetrics.outputTokens,
-      coderMetrics.cacheReadTokens,
-      coderMetrics.cacheCreationTokens,
-    );
+    const costUsd = coderResult.metrics.costUsd;
+    const { costSource, runtimeUsed } = mapRuntimeToCostMeta(coderResult.runtime);
 
     logger.info(
-      { projectId, sprintId: sprint.id, round, durationMs, costUsd, toolUses: coderMetrics.toolUses, apiRequests: coderMetrics.apiRequests },
-      'Coder finished',
+      {
+        projectId, sprintId: sprint.id, round, durationMs, costUsd,
+        toolUses: coderResult.metrics.toolUses,
+        apiRequests: coderResult.metrics.apiRequests,
+        runtime: coderResult.runtime,
+        costSource,
+      },
+      'Coder finished via executeAgent',
     );
 
     return {
-      inputTokens: coderMetrics.inputTokens,
-      outputTokens: coderMetrics.outputTokens,
-      cacheTokens: coderMetrics.cacheReadTokens + coderMetrics.cacheCreationTokens,
+      inputTokens: coderResult.metrics.inputTokens,
+      outputTokens: coderResult.metrics.outputTokens,
+      cacheTokens: coderResult.metrics.cacheReadTokens + coderResult.metrics.cacheCreationTokens,
       costUsd,
       durationMs,
-      toolUses: coderMetrics.toolUses,
-      apiRequests: coderMetrics.apiRequests,
-      output: fullOutput,
+      toolUses: coderResult.metrics.toolUses,
+      apiRequests: coderResult.metrics.apiRequests,
+      output: coderResult.output,
       toolCallsAccum: coderToolCallsAccum,
       promptUsed: prompt,
+      costSource,
+      runtimeUsed,
+      providerUsed: coderResult.provider,
+      modelUsed: coderResult.model,
+      // SPEC Camada 4: propaga telemetria de apply_patch failures (0 pra non-Codex).
+      codexPatchFailures: coderResult.metadata?.codex?.applyPatchFailures ?? 0,
     };
   }
 
@@ -1124,6 +1008,11 @@ export class HarnessEngine {
     evaluation: EvaluationResult;
     output: string;
     toolCallsAccum: Array<{ tool: string; input: unknown }>;
+    costSource: 'sdk_anthropic' | 'calculated' | 'reported' | 'fallback_zero';
+    runtimeUsed: 'cloud' | 'local' | 'external';
+    providerUsed: string;
+    modelUsed: string;
+    parseTier: string;
   }> {
     const project = getHarnessProject(projectId);
     if (!project) throw new Error(`Project ${projectId} not found`);
@@ -1134,8 +1023,10 @@ export class HarnessEngine {
     const evaluatorAgent = getAgent(evaluatorAgentId);
     if (!evaluatorAgent) throw new Error(`Evaluator agent not found: ${evaluatorAgentId}`);
 
-    // 2. Build evaluator prompt
-    const prompt = buildEvaluatorPrompt(sprintJson, project.projectPath);
+    // 2. Build evaluator prompt — resolve specPath so the agent reads the right
+    // file (security pipeline writes per-pipeline SPEC<docsId>.md, not SPEC.md).
+    const evaluatorSpecPath = resolveSpecPath(project);
+    const prompt = buildEvaluatorPrompt(sprintJson, project.projectPath, evaluatorSpecPath);
 
     // 3. Validate cwd
     if (!fs.existsSync(project.projectPath)) {
@@ -1144,117 +1035,80 @@ export class HarnessEngine {
 
     const state = this.getState(projectId);
     const startedAt = Date.now();
-    const evalToolNames = evaluatorAgent.allowedTools.length > 0
-      ? evaluatorAgent.allowedTools
-      : ['Read', 'Glob', 'Grep', 'Bash'];
-
-    let fullOutput: string;
-    let evalInputTokens: number;
-    let evalOutputTokens: number;
-    let evalCacheTokens: number;
-    let evalToolUses: number;
-    let evalApiRequests: number;
 
     // Accumulate tool calls for pipeline_messages persistence
     const evalToolCallsAccum: Array<{ tool: string; input: unknown }> = [];
 
-    // ---- Local LLM path (Ollama / LM Studio / OpenAI-compatible) ----
-    if (evaluatorAgent.runtime === 'local' && evaluatorAgent.localConfig) {
-      const localCfg = evaluatorAgent.localConfig;
-      const localTools = builtinToolsToOllamaSchemas(evalToolNames);
-
-      logger.info(
-        { projectId, sprintId: sprint.id, round, provider: localCfg.provider, model: localCfg.model },
-        'Spawning Evaluator via local LLM',
-      );
-
-      const localResult = await ollamaChatWithTools(
-        localCfg.baseUrl,
-        localCfg.model,
-        evaluatorAgent.systemPrompt || '',
-        prompt,
-        localTools,
-        {
-          cwd: project.projectPath,
-          provider: (localCfg.provider || 'ollama') as LocalLLMProvider,
-          onText: (text) => {
-            const evt = { type: 'text', content: text };
-            this.emitIPC('harness:agent-stream', { projectId, sprintId: sprint.id, round, agent: 'evaluator', event: evt });
-            this.persistStreamEvent(projectId, sprint.id, round, 'evaluator', evt);
-          },
-          onToolUse: (record) => {
-            const evt = { type: 'tool_call', tool: record.tool };
-            this.emitIPC('harness:agent-stream', { projectId, sprintId: sprint.id, round, agent: 'evaluator', event: evt });
-            this.persistStreamEvent(projectId, sprint.id, round, 'evaluator', evt);
-            evalToolCallsAccum.push({ tool: record.tool, input: record.input ?? {} });
-          },
-        },
-      );
-
-      fullOutput = localResult.content;
-      evalInputTokens = localResult.promptTokens;
-      evalOutputTokens = localResult.tokensUsed;
-      evalCacheTokens = 0;
-      evalToolUses = localResult.toolCalls.length;
-      evalApiRequests = 1;
-    } else {
-      // ---- Cloud SDK path ----
-      const cliPath = getClaudeCodeExecutablePath();
-      await ensureAuthForSDK();
-
-      const { query } = await import('@anthropic-ai/claude-agent-sdk');
-      const evalMcps = await resolveMCPsForHarnessAgent(evaluatorAgentId);
-
-      const q = query({
-        prompt,
-        options: {
-          pathToClaudeCodeExecutable: cliPath,
-          cwd: project.projectPath,
-          model: evaluatorAgent.model,
-          systemPrompt: evaluatorAgent.systemPrompt || '',
-          allowedTools: evalToolNames,
-          permissionMode: 'bypassPermissions' as const,
-          allowDangerouslySkipPermissions: true,
-          includePartialMessages: true,
-          abortController: state.abortController ?? undefined,
-          ...(evalMcps ? { mcpServers: evalMcps } : {}),
-        },
-      });
-
-      const streamResult = await processAgentStream(q, {
-        shouldAbort: () => state.abortController?.signal.aborted ?? false,
-        onText: (text) => {
-          const evt = { type: 'text', content: text };
-          this.emitIPC('harness:agent-stream', { projectId, sprintId: sprint.id, round, agent: 'evaluator', event: evt });
-          this.persistStreamEvent(projectId, sprint.id, round, 'evaluator', evt);
-        },
-        onToolUse: (toolName) => {
-          const evt = { type: 'tool_call', tool: toolName };
-          this.emitIPC('harness:agent-stream', { projectId, sprintId: sprint.id, round, agent: 'evaluator', event: evt });
-          this.persistStreamEvent(projectId, sprint.id, round, 'evaluator', evt);
-          evalToolCallsAccum.push({ tool: toolName, input: {} });
-        },
-      });
-
-      fullOutput = streamResult.output;
-      evalInputTokens = streamResult.metrics.inputTokens;
-      evalOutputTokens = streamResult.metrics.outputTokens;
-      evalCacheTokens = streamResult.metrics.cacheReadTokens + streamResult.metrics.cacheCreationTokens;
-      evalToolUses = streamResult.metrics.toolUses;
-      evalApiRequests = streamResult.metrics.apiRequests;
-    }
-
-    const durationMs = Date.now() - startedAt;
-    const costUsd = calculateCost(
-      evaluatorAgent.model,
-      evalInputTokens,
-      evalOutputTokens,
-      evaluatorAgent.runtime === 'local' ? 0 : evalCacheTokens,
-      0,
+    // S1.0/P1.1: substituido o switch manual por executeAgent — despacho por
+    // runtime (cloud/codex/local/external) acontece dentro do agent-runtime.
+    // Stream events mantem o NESTED shape ({ projectId, sprintId, round, agent, event })
+    // por compat com o subscriber em ExecutionView.
+    logger.info(
+      { projectId, sprintId: sprint.id, round, runtime: evaluatorAgent.runtime, model: evaluatorAgent.model },
+      'Spawning Evaluator via executeAgent',
     );
 
+    if (!state.abortController) {
+      state.abortController = new AbortController();
+    }
+    const evalAbortController = state.abortController;
+
+    const evalResult = await executeAgent({
+      agentId: evaluatorAgent.id,
+      prompt,
+      cwd: project.projectPath,
+      abortController: evalAbortController,
+      permission: PERM_BYPASS_NO_GUARD,
+      projectId,
+      onText: (text) => {
+        const evt = { type: 'text', content: text };
+        this.emitIPC('harness:agent-stream', { projectId, sprintId: sprint.id, round, agent: 'evaluator', event: evt });
+        this.persistStreamEvent(projectId, sprint.id, round, 'evaluator', evt);
+      },
+      onToolUse: (toolName) => {
+        const evt = { type: 'tool_call', tool: toolName };
+        this.emitIPC('harness:agent-stream', { projectId, sprintId: sprint.id, round, agent: 'evaluator', event: evt });
+        this.persistStreamEvent(projectId, sprint.id, round, 'evaluator', evt);
+      },
+      onToolUseComplete: (toolName, input) => {
+        evalToolCallsAccum.push({ tool: toolName, input: input ?? {} });
+      },
+    });
+
+    const fullOutput = evalResult.output;
+    const evalInputTokens = evalResult.metrics.inputTokens;
+    const evalOutputTokens = evalResult.metrics.outputTokens;
+    const evalCacheTokens = evalResult.metrics.cacheReadTokens + evalResult.metrics.cacheCreationTokens;
+    const evalToolUses = evalResult.metrics.toolUses;
+    const evalApiRequests = evalResult.metrics.apiRequests;
+    const { costSource: evalCostSource, runtimeUsed: evalRuntimeUsed } =
+      mapRuntimeToCostMeta(evalResult.runtime);
+    const evalProviderUsed = evalResult.provider;
+    const evalModelUsed = evalResult.model;
+
+    // Cloud-only fields used by extractEvaluationJSON for fallback tiers.
+    const evalExtractSource: import('./json-extractor').ExtractJSONSource | undefined =
+      evalResult.accumulatedText !== undefined && evalResult.textBlocks !== undefined
+        ? {
+            output: fullOutput,
+            accumulatedText: evalResult.accumulatedText,
+            textBlocks: evalResult.textBlocks,
+          }
+        : undefined;
+
+    const durationMs = Date.now() - startedAt;
+    // S1.0/P1.1: usa o costUsd ja calculado pelo executor (D6).
+    const costUsd = evalResult.metrics.costUsd;
+
     // 5. Parse and validate the evaluation output
-    let evaluation = parseEvaluationOutput(fullOutput, round);
+    const { evaluation: rawEvaluation, tier: parseTier } = evalExtractSource
+      ? extractEvaluationJSON(evalExtractSource, round, sprintJson.id)
+      : (() => {
+          const meta: { repaired?: boolean } = {};
+          const evaluation = parseEvaluationOutput(fullOutput, round, meta);
+          return { evaluation, tier: meta.repaired ? 'jsonrepair' : ('result' as const) };
+        })();
+    let evaluation = rawEvaluation;
     evaluation = validateCriteria(evaluation, sprintJson);
 
     // 6. Save evaluation.json to filesystem
@@ -1283,6 +1137,11 @@ export class HarnessEngine {
       evaluation,
       output: fullOutput,
       toolCallsAccum: evalToolCallsAccum,
+      costSource: evalCostSource,
+      runtimeUsed: evalRuntimeUsed,
+      providerUsed: evalProviderUsed,
+      modelUsed: evalModelUsed,
+      parseTier,
     };
   }
 
@@ -1298,7 +1157,7 @@ export class HarnessEngine {
     const sprints = getHarnessSprints(projectId);
     if (sprints.length === 0) throw new Error('No sprints found for project');
 
-    updateHarnessProject(projectId, { status: 'running' });
+    setProjectStatus(projectId, 'running');
     this.emitIPC('harness:project-update', { projectId, status: 'running' });
 
     for (let i = 0; i < sprints.length; i++) {
@@ -1326,9 +1185,8 @@ export class HarnessEngine {
       });
       this.emitIPC('harness:sprint-update', { projectId, sprintId: sprint.id, status: 'running' });
 
-      // Read sprints.json to find the matching SprintJsonEntry
-      const projectDir = this.getProjectDir(projectId);
-      const sprintsJson = readLatestSprintsJson(projectDir);
+      // Read sprints.json do canonical no projeto-alvo (era getProjectDir legado). Ver Bug #8.
+      const sprintsJson = readHarnessSprintsJson(project);
       if (!sprintsJson) {
         logger.error({ projectId, sprintId: sprint.id }, 'No sprints.json found during run');
         updateHarnessSprint(sprint.id, { status: 'failed' });
@@ -1355,7 +1213,7 @@ export class HarnessEngine {
         logger.info({ projectId, sprintId: sprint.id, round: roundNum }, 'Starting coder round');
 
         // Insert round record
-        const roundRecord = insertHarnessRound({
+        const roundRecord = persistHarnessRound.insert({
           sprintId: sprint.id,
           roundNumber: roundNum,
         });
@@ -1371,7 +1229,7 @@ export class HarnessEngine {
           );
         } catch (coderErr) {
           logger.error({ err: coderErr, projectId, sprintId: sprint.id, round: roundNum }, 'Coder failed');
-          updateHarnessRound(roundRecord.id, {
+          persistHarnessRound.update(roundRecord.id, {
             verdict: 'fail',
             feedbackSummary: (coderErr as Error).message,
             completedAt: new Date().toISOString(),
@@ -1380,7 +1238,7 @@ export class HarnessEngine {
         }
 
         // Persist coder metrics (verdict will be set by the Evaluator below)
-        updateHarnessRound(roundRecord.id, {
+        persistHarnessRound.update(roundRecord.id, {
           coderInputTokens: coderMetrics.inputTokens,
           coderOutputTokens: coderMetrics.outputTokens,
           coderCacheTokens: coderMetrics.cacheTokens,
@@ -1388,6 +1246,10 @@ export class HarnessEngine {
           coderDurationMs: coderMetrics.durationMs,
           coderToolUses: coderMetrics.toolUses,
           coderApiRequests: coderMetrics.apiRequests,
+          costSource: coderMetrics.costSource,
+          runtimeUsed: coderMetrics.runtimeUsed,
+          providerUsed: coderMetrics.providerUsed,
+          modelUsed: coderMetrics.modelUsed,
         });
 
         // Update rounds used counter
@@ -1407,7 +1269,7 @@ export class HarnessEngine {
             { err: evalErr, projectId, sprintId: sprint.id, round: roundNum },
             'Evaluator failed',
           );
-          updateHarnessRound(roundRecord.id, {
+          persistHarnessRound.update(roundRecord.id, {
             verdict: 'fail',
             feedbackSummary: (evalErr as Error).message,
             completedAt: new Date().toISOString(),
@@ -1416,7 +1278,7 @@ export class HarnessEngine {
         }
 
         // Persist evaluator metrics + verdict
-        updateHarnessRound(roundRecord.id, {
+        persistHarnessRound.update(roundRecord.id, {
           evaluatorInputTokens: evaluatorMetrics.inputTokens,
           evaluatorOutputTokens: evaluatorMetrics.outputTokens,
           evaluatorCacheTokens: evaluatorMetrics.cacheTokens,
@@ -1515,7 +1377,7 @@ export class HarnessEngine {
           completedAt: new Date().toISOString(),
         });
         this.emitIPC('harness:sprint-update', { projectId, sprintId: sprint.id, status: 'failed' });
-        updateHarnessProject(projectId, { status: 'paused' });
+        setProjectStatus(projectId, 'paused');
         this.emitIPC('harness:project-update', { projectId, status: 'paused' });
         state.status = 'paused';
         logger.warn(
@@ -1527,8 +1389,35 @@ export class HarnessEngine {
     }
 
     if (!state.abortController?.signal.aborted) {
-      updateHarnessProject(projectId, { status: 'done' });
+      setProjectStatus(projectId, 'done');
       this.emitIPC('harness:project-update', { projectId, status: 'done' });
+
+      // Smoke Test (informativo, NAO bloqueia)
+      try {
+        // Le sprints.json do canonical no projeto-alvo. Ver Bug #8.
+        const sprintsJson = readHarnessSprintsJson(project);
+        const expectedFiles = sprintsJson?.sprints.flatMap(s => s.hints?.existing_files ?? []) ?? [];
+        const docsCtx = getPipelineDocsContext(project.projectPath, project.pipelineDocsId ?? null);
+        const reportPath = docsCtx
+          ? docsCtx.resolveDocPath('smoke-test.md')
+          : path.join(project.projectPath, 'smoke-test.md');
+        const smoke = await runSmokeTest(project.projectPath, expectedFiles);
+        writeSmokeTestReport(smoke, reportPath);
+        logger.info(
+          {
+            projectId,
+            reportPath,
+            typecheckOk: smoke.typecheck.ok,
+            lintAvailable: smoke.lint.available,
+            testsAvailable: smoke.tests.available,
+            brokenImports: smoke.brokenImports.length,
+            missingFiles: smoke.missingFiles.length,
+          },
+          'Smoke test completed',
+        );
+      } catch (smokeErr) {
+        logger.warn({ err: smokeErr, projectId }, 'Smoke test failed (non-blocking)');
+      }
     }
     state.status = 'idle';
   }
@@ -1547,8 +1436,8 @@ export class HarnessEngine {
     }
 
     const sprint = sprints[sprintIndex];
-    const projectDir = this.getProjectDir(projectId);
-    const sprintsJson = readLatestSprintsJson(projectDir);
+    // Le sprints.json do canonical no projeto-alvo. Ver Bug #8.
+    const sprintsJson = readHarnessSprintsJson(project);
     if (!sprintsJson) throw new Error('No sprints.json found');
 
     const sprintJson = sprintsJson.sprints.find(s => s.id === sprint.sprintJsonId);
@@ -1567,8 +1456,8 @@ export class HarnessEngine {
     let sprintPassed = false;
     let totalRounds = 0;
 
-    const aggCoder: SprintMetrics = { inputTokens: 0, outputTokens: 0, cacheTokens: 0, costUsd: 0, durationMs: 0, toolUses: 0, apiRequests: 0 };
-    const aggEval: SprintMetrics = { inputTokens: 0, outputTokens: 0, cacheTokens: 0, costUsd: 0, durationMs: 0, toolUses: 0, apiRequests: 0 };
+    const aggCoder: SprintMetrics = { inputTokens: 0, outputTokens: 0, cacheTokens: 0, costUsd: 0, durationMs: 0, toolUses: 0, apiRequests: 0, model: null, runtime: null };
+    const aggEval: SprintMetrics = { inputTokens: 0, outputTokens: 0, cacheTokens: 0, costUsd: 0, durationMs: 0, toolUses: 0, apiRequests: 0, model: null, runtime: null };
 
     for (let roundNum = 1; roundNum <= maxRounds; roundNum++) {
       if (state.abortController?.signal.aborted) break;
@@ -1576,15 +1465,17 @@ export class HarnessEngine {
       totalRounds = roundNum;
       logger.info({ projectId, sprintId: sprint.id, round: roundNum }, 'runSingleSprint: coder round');
 
-      const roundRecord = insertHarnessRound({ sprintId: sprint.id, roundNumber: roundNum });
+      const roundRecord = persistHarnessRound.insert({ sprintId: sprint.id, roundNumber: roundNum });
 
       if (roundNum > 1) {
+        const coderAgentForModel = sprint.coderAgentId ? getAgent(sprint.coderAgentId) : null;
         this.emitIPC('pipeline:phase-changed', {
           projectId,
           phase: 13,
           phaseName: 'Coder',
           status: 'running',
           awaitingUser: false,
+          currentModel: coderAgentForModel?.model ?? null,
         });
       }
 
@@ -1594,11 +1485,11 @@ export class HarnessEngine {
         coderMetrics = await this.spawnCoder(projectId, sprint, sprintJson, roundNum, roundNum > 1 ? lastFeedback : undefined);
       } catch (coderErr) {
         logger.error({ err: coderErr, projectId, sprintId: sprint.id, round: roundNum }, 'Coder failed');
-        updateHarnessRound(roundRecord.id, { verdict: 'fail', feedbackSummary: (coderErr as Error).message, completedAt: new Date().toISOString() });
+        persistHarnessRound.update(roundRecord.id, { verdict: 'fail', feedbackSummary: (coderErr as Error).message, completedAt: new Date().toISOString() });
         break;
       }
 
-      updateHarnessRound(roundRecord.id, {
+      persistHarnessRound.update(roundRecord.id, {
         coderInputTokens: coderMetrics.inputTokens,
         coderOutputTokens: coderMetrics.outputTokens,
         coderCacheTokens: coderMetrics.cacheTokens,
@@ -1606,6 +1497,12 @@ export class HarnessEngine {
         coderDurationMs: coderMetrics.durationMs,
         coderToolUses: coderMetrics.toolUses,
         coderApiRequests: coderMetrics.apiRequests,
+        costSource: coderMetrics.costSource,
+        runtimeUsed: coderMetrics.runtimeUsed,
+        providerUsed: coderMetrics.providerUsed,
+        modelUsed: coderMetrics.modelUsed,
+        // SPEC Camada 4: persistencia da telemetria Codex (sempre 0 para outros runtimes)
+        codexPatchFailures: coderMetrics.codexPatchFailures,
       });
       aggCoder.inputTokens += coderMetrics.inputTokens;
       aggCoder.outputTokens += coderMetrics.outputTokens;
@@ -1614,31 +1511,39 @@ export class HarnessEngine {
       aggCoder.durationMs += coderMetrics.durationMs;
       aggCoder.toolUses += coderMetrics.toolUses;
       aggCoder.apiRequests += coderMetrics.apiRequests;
+      aggCoder.model = coderMetrics.modelUsed;
+      aggCoder.runtime = coderMetrics.runtimeUsed;
 
       // Persist coder prompt (user role) and output (assistant role) to pipeline_messages
       try {
         if (coderMetrics.promptUsed) {
-          savePipelineMessage({
-            projectId,
-            phaseNumber: 13,
-            role: 'user',
-            content: coderMetrics.promptUsed,
-            sprintIndex,
-            roundIndex: roundNum,
-            agentId: sprint.coderAgentId ?? 'harness-coder',
-          });
+          persistMessage(
+            {
+              kind: 'pipeline',
+              projectId,
+              phaseNumber: 13,
+              sprintIndex,
+              roundIndex: roundNum,
+              agentId: sprint.coderAgentId ?? 'harness-coder',
+            },
+            'user',
+            coderMetrics.promptUsed,
+          );
         }
         if (coderMetrics.output) {
-          savePipelineMessage({
-            projectId,
-            phaseNumber: 13,
-            role: 'assistant',
-            content: coderMetrics.output,
-            toolCalls: coderMetrics.toolCallsAccum.length > 0 ? coderMetrics.toolCallsAccum : undefined,
-            sprintIndex,
-            roundIndex: roundNum,
-            agentId: sprint.coderAgentId ?? 'harness-coder',
-          });
+          persistMessage(
+            {
+              kind: 'pipeline',
+              projectId,
+              phaseNumber: 13,
+              sprintIndex,
+              roundIndex: roundNum,
+              agentId: sprint.coderAgentId ?? 'harness-coder',
+            },
+            'assistant',
+            coderMetrics.output,
+            { toolCalls: coderMetrics.toolCallsAccum.length > 0 ? coderMetrics.toolCallsAccum : undefined },
+          );
         }
       } catch (saveErr) {
         logger.warn({ err: saveErr, projectId, sprintId: sprint.id, round: roundNum }, 'Failed to save coder pipeline_message — non-critical');
@@ -1646,25 +1551,52 @@ export class HarnessEngine {
 
       updateHarnessSprint(sprint.id, { roundsUsed: roundNum });
 
+      const evaluatorAgentForModel = sprint.evaluatorAgentId ? getAgent(sprint.evaluatorAgentId) : null;
       this.emitIPC('pipeline:phase-changed', {
         projectId,
         phase: 14,
         phaseName: 'Evaluator',
         status: 'running',
         awaitingUser: false,
+        currentModel: evaluatorAgentForModel?.model ?? null,
       });
 
       // --- Evaluator ---
-      let evaluatorMetrics: Awaited<ReturnType<typeof this.spawnEvaluator>>;
-      try {
-        evaluatorMetrics = await this.spawnEvaluator(projectId, sprint, sprintJson, roundNum);
-      } catch (evalErr) {
-        logger.error({ err: evalErr, projectId, sprintId: sprint.id, round: roundNum }, 'Evaluator failed');
-        updateHarnessRound(roundRecord.id, { verdict: 'fail', feedbackSummary: (evalErr as Error).message, completedAt: new Date().toISOString() });
+      // Retry 1x quando erro for JSON parse (sonnet as vezes nao emite JSON valido
+      // por output truncado, max_tokens hit, ou abort intermitente). Erros nao-parse
+      // (network, abort do user, etc) falham direto sem retry.
+      const MAX_EVAL_RETRIES = 1;
+      let evaluatorMetrics: Awaited<ReturnType<typeof this.spawnEvaluator>> | undefined;
+      let evalFinalError: Error | undefined;
+      for (let evalAttempt = 0; evalAttempt <= MAX_EVAL_RETRIES; evalAttempt++) {
+        try {
+          evaluatorMetrics = await this.spawnEvaluator(projectId, sprint, sprintJson, roundNum);
+          break;
+        } catch (evalErr) {
+          const msg = (evalErr as Error).message ?? '';
+          const isParseError =
+            msg.includes('contains no JSON object') ||
+            msg.includes('contains no valid JSON') ||
+            msg.includes('Evaluator returned empty output');
+          if (isParseError && evalAttempt < MAX_EVAL_RETRIES) {
+            logger.warn(
+              { projectId, sprintId: sprint.id, round: roundNum, evalAttempt: evalAttempt + 1, totalAttempts: MAX_EVAL_RETRIES + 1 },
+              'Evaluator JSON parse falhou — retrying',
+            );
+            continue;
+          }
+          evalFinalError = evalErr as Error;
+          break;
+        }
+      }
+
+      if (!evaluatorMetrics) {
+        logger.error({ err: evalFinalError, projectId, sprintId: sprint.id, round: roundNum }, 'Evaluator failed (apos retries)');
+        persistHarnessRound.update(roundRecord.id, { verdict: 'fail', feedbackSummary: evalFinalError?.message ?? 'Evaluator falhou', completedAt: new Date().toISOString() });
         break;
       }
 
-      updateHarnessRound(roundRecord.id, {
+      persistHarnessRound.update(roundRecord.id, {
         evaluatorInputTokens: evaluatorMetrics.inputTokens,
         evaluatorOutputTokens: evaluatorMetrics.outputTokens,
         evaluatorCacheTokens: evaluatorMetrics.cacheTokens,
@@ -1675,6 +1607,7 @@ export class HarnessEngine {
         verdict: evaluatorMetrics.evaluation.verdict,
         feedbackSummary: evaluatorMetrics.evaluation.summary,
         completedAt: new Date().toISOString(),
+        metadata: { evaluatorParseTier: evaluatorMetrics.parseTier },
       });
       aggEval.inputTokens += evaluatorMetrics.inputTokens;
       aggEval.outputTokens += evaluatorMetrics.outputTokens;
@@ -1683,20 +1616,25 @@ export class HarnessEngine {
       aggEval.durationMs += evaluatorMetrics.durationMs;
       aggEval.toolUses += evaluatorMetrics.toolUses;
       aggEval.apiRequests += evaluatorMetrics.apiRequests;
+      aggEval.model = evaluatorMetrics.modelUsed;
+      aggEval.runtime = evaluatorMetrics.runtimeUsed;
 
       // Persist evaluator output (assistant role) to pipeline_messages
       try {
         if (evaluatorMetrics.output) {
-          savePipelineMessage({
-            projectId,
-            phaseNumber: 14,
-            role: 'assistant',
-            content: evaluatorMetrics.output,
-            toolCalls: evaluatorMetrics.toolCallsAccum.length > 0 ? evaluatorMetrics.toolCallsAccum : undefined,
-            sprintIndex,
-            roundIndex: roundNum,
-            agentId: sprint.evaluatorAgentId ?? 'harness-evaluator',
-          });
+          persistMessage(
+            {
+              kind: 'pipeline',
+              projectId,
+              phaseNumber: 14,
+              sprintIndex,
+              roundIndex: roundNum,
+              agentId: sprint.evaluatorAgentId ?? 'harness-evaluator',
+            },
+            'assistant',
+            evaluatorMetrics.output,
+            { toolCalls: evaluatorMetrics.toolCallsAccum.length > 0 ? evaluatorMetrics.toolCallsAccum : undefined },
+          );
         }
       } catch (saveErr) {
         logger.warn({ err: saveErr, projectId, sprintId: sprint.id, round: roundNum }, 'Failed to save evaluator pipeline_message — non-critical');
@@ -1816,7 +1754,9 @@ export class HarnessEngine {
     }
 
     state.status = 'idle';
-    updateHarnessProject(projectId, { status: 'paused' });
+    // Persist 'paused' (not 'aborted'): user can resume from this state. The
+    // resume() method explicitly checks for status === 'paused' to re-execute.
+    setProjectStatus(projectId, 'paused');
     this.emitIPC('harness:project-update', { projectId, status: 'paused' });
     logger.info({ projectId }, 'Harness aborted - project paused for resume');
   }
@@ -1833,10 +1773,22 @@ export class HarnessEngine {
   // ---- Enrich Pipeline ----
 
   /**
-   * Internal helper: run one query() call for an enrich agent and stream
+   * Internal helper: run one executeAgent() call for an enrich agent and stream
    * events to the renderer. Returns accumulated metrics for the turn.
+   *
+   * S1.1 refactor: substituiu a antiga implementacao que chamava query() direto
+   * do SDK por executeAgent + perfil PERM_DEFAULT_WITH_GUARD com
+   * createEnrichPermissionGuard. O guard preserva 100% o comportamento atual:
+   * auto-approve em activeEnrichAllowedPaths, delega para o guard padrao em
+   * todo o resto.
+   *
+   * Diferenca vs implementacao anterior: o evento 'thinking' nao e mais emitido
+   * porque executeAgent (via cloud-executor) nao expoe onThinking. O renderer
+   * hoje so consome text/tool_call/done. Se thinking voltar a ser necessario,
+   * sera preciso expor onThinking no AgentExecutionRequest e passa-lo down ate
+   * o cloud-executor.
    */
-  private async runEnrichQuery(
+  private async runEnrichExecuteAgent(
     prompt: string,
     agent: import('../../src/types').AgentConfig,
     specPath: string,
@@ -1853,16 +1805,6 @@ export class HarnessEngine {
     toolUses: number;
     apiRequests: number;
   }> {
-    ensureNodeInPath();
-    await ensureAuthForSDK();
-
-    const cliPath = getClaudeCodeExecutablePath();
-    if (!fs.existsSync(cliPath)) {
-      throw new Error(`Claude Agent SDK cli.js not found at ${cliPath}. Run npm install.`);
-    }
-
-    const { query } = await import('@anthropic-ai/claude-agent-sdk');
-
     // Use the abort controller from the active enrich session
     const abort = this.activeEnrichSession?.abort ?? new AbortController();
 
@@ -1871,36 +1813,23 @@ export class HarnessEngine {
 
     logger.info(
       { sessionId, phase, agentId: agent.id, model: agent.model, cwd, isFollowUp },
-      'Starting enrich agent query',
+      'Starting enrich agent via executeAgent',
     );
-
-    const enrichMcps = await resolveMCPsForHarnessAgent(agent.id);
-    const q = query({
-      prompt,
-      options: {
-        pathToClaudeCodeExecutable: cliPath,
-        cwd,
-        model: agent.model,
-        systemPrompt: agent.systemPrompt || '',
-        allowedTools: agent.allowedTools,
-        permissionMode: 'default' as const,
-        includePartialMessages: true,
-        abortController: abort,
-        ...(enrichMcps ? { mcpServers: enrichMcps } : {}),
-        stderr: (text: string) => {
-          logger.info({ stderr: text.substring(0, 500), sessionId, phase }, 'Enrich agent stderr');
-        },
-      },
-    });
-
-    const startedAt = Date.now();
 
     // Accumulators for persisting the full assistant message after the stream
     let accumulatedText = '';
     const accumulatedToolCalls: Array<{ tool: string; input: unknown }> = [];
 
-    const { metrics: enrichMetrics } = await processAgentStream(q, {
-      shouldAbort: () => abort.signal.aborted,
+    const enrichGuard = createEnrichPermissionGuard(this.getWindow);
+
+    const startedAt = Date.now();
+
+    const result = await executeAgent({
+      agentId: agent.id,
+      prompt,
+      cwd,
+      abortController: abort,
+      permission: PERM_DEFAULT_WITH_GUARD(enrichGuard),
       onText: (text) => {
         accumulatedText += text;
         this.emitIPC('enrich:stream', {
@@ -1926,47 +1855,38 @@ export class HarnessEngine {
           phase,
         });
       },
-      onRawEvent: (event) => {
-        // Capture tool input from content_block_start for DB persistence
-        if (event['type'] === 'content_block_start') {
-          const block = event['content_block'] as Record<string, unknown> | undefined;
-          if (block?.['type'] === 'tool_use') {
-            const toolName = block['name'] as string;
-            const toolInput = (block['input'] ?? {}) as unknown;
-            accumulatedToolCalls.push({ tool: toolName, input: toolInput });
-          }
-        }
-      },
-      onResult: (resultText) => {
-        // Emit the final result text as a stream chunk so the renderer knows
-        // the agent has finished its turn.
-        if (resultText) {
-          this.emitIPC('enrich:stream', {
-            type: 'done',
-            content: resultText,
-            sessionId,
-            phase,
-          });
-        } else {
-          this.emitIPC('enrich:stream', {
-            type: 'done',
-            sessionId,
-            phase,
-          });
-        }
-        logger.info({ sessionId, phase }, 'Enrich agent turn completed');
+      onToolUseComplete: (toolName, input) => {
+        accumulatedToolCalls.push({ tool: toolName, input: input ?? {} });
       },
     });
+
+    // Emit 'done' so the renderer knows the agent has finished its turn.
+    // executeAgent has no onResult callback — it only resolves when complete —
+    // so we synthesize the 'done' event here.
+    if (result.output) {
+      this.emitIPC('enrich:stream', {
+        type: 'done',
+        content: result.output,
+        sessionId,
+        phase,
+      });
+    } else {
+      this.emitIPC('enrich:stream', {
+        type: 'done',
+        sessionId,
+        phase,
+      });
+    }
+    logger.info({ sessionId, phase }, 'Enrich agent turn completed');
 
     // Persist the full assistant message to the database
     if (accumulatedText || accumulatedToolCalls.length > 0) {
       try {
-        insertEnrichMessage(
-          sessionId,
-          phase,
+        persistMessage(
+          { kind: 'enrich', sessionId, phase },
           'assistant',
           accumulatedText,
-          accumulatedToolCalls.length > 0 ? accumulatedToolCalls : undefined,
+          { toolCalls: accumulatedToolCalls.length > 0 ? accumulatedToolCalls : undefined },
         );
       } catch (err) {
         logger.error({ err, sessionId, phase }, 'Failed to persist enrich assistant message');
@@ -1974,28 +1894,34 @@ export class HarnessEngine {
     }
 
     const durationMs = Date.now() - startedAt;
-    const costUsd = calculateCost(
-      agent.model,
-      enrichMetrics.inputTokens,
-      enrichMetrics.outputTokens,
-      enrichMetrics.cacheReadTokens,
-      enrichMetrics.cacheCreationTokens,
-    );
+    // S1.3: usa o costUsd ja computado pelo executor (cloud-executor chama
+    // calculateCost internamente com os mesmos args). Recalcular aqui causaria
+    // double-count. Ver JSDoc em pricing.ts:calculateCost para o pattern.
+    const costUsd = result.metrics.costUsd;
 
     logger.info(
-      { sessionId, phase, durationMs, costUsd, toolUses: enrichMetrics.toolUses, apiRequests: enrichMetrics.apiRequests, inputTokens: enrichMetrics.inputTokens, outputTokens: enrichMetrics.outputTokens },
-      'Enrich query metrics collected',
+      {
+        sessionId,
+        phase,
+        durationMs,
+        costUsd,
+        toolUses: result.metrics.toolUses,
+        apiRequests: result.metrics.apiRequests,
+        inputTokens: result.metrics.inputTokens,
+        outputTokens: result.metrics.outputTokens,
+      },
+      'Enrich executeAgent metrics collected',
     );
 
     return {
-      inputTokens: enrichMetrics.inputTokens,
-      outputTokens: enrichMetrics.outputTokens,
-      cacheReadTokens: enrichMetrics.cacheReadTokens,
-      cacheCreationTokens: enrichMetrics.cacheCreationTokens,
+      inputTokens: result.metrics.inputTokens,
+      outputTokens: result.metrics.outputTokens,
+      cacheReadTokens: result.metrics.cacheReadTokens,
+      cacheCreationTokens: result.metrics.cacheCreationTokens,
       costUsd,
       durationMs,
-      toolUses: enrichMetrics.toolUses,
-      apiRequests: enrichMetrics.apiRequests,
+      toolUses: result.metrics.toolUses,
+      apiRequests: result.metrics.apiRequests,
     };
   }
 
@@ -2066,13 +1992,13 @@ export class HarnessEngine {
     try {
       // 8. Persist the initial user prompt as the first message of the session
       try {
-        insertEnrichMessage(config.sessionId, 'validator', 'user', prompt);
+        persistMessage({ kind: 'enrich', sessionId: config.sessionId, phase: 'validator' }, 'user', prompt);
       } catch (err) {
         logger.error({ err, sessionId: config.sessionId }, 'Failed to persist enrich initial user message');
       }
 
       // 9. Run the validator agent (first turn)
-      const metrics = await this.runEnrichQuery(
+      const metrics = await this.runEnrichExecuteAgent(
         prompt,
         validatorAgent,
         config.specPath,
@@ -2175,7 +2101,7 @@ export class HarnessEngine {
 
     // Persist the user message before querying the agent
     try {
-      insertEnrichMessage(sessionId, phase as 'validator' | 'enricher', 'user', message);
+      persistMessage({ kind: 'enrich', sessionId, phase: phase as 'validator' | 'enricher' }, 'user', message);
     } catch (err) {
       logger.error({ err, sessionId, phase }, 'Failed to persist enrich user message');
     }
@@ -2187,7 +2113,7 @@ export class HarnessEngine {
       : buildEnricherFollowUpPrompt(specPath, message);
 
     try {
-      const metrics = await this.runEnrichQuery(
+      const metrics = await this.runEnrichExecuteAgent(
         fullPrompt,
         agent,
         specPath,
@@ -2284,12 +2210,12 @@ export class HarnessEngine {
     try {
       // Persist the enricher initial prompt as the first user message of the enricher phase
       try {
-        insertEnrichMessage(sessionId, 'enricher', 'user', prompt);
+        persistMessage({ kind: 'enrich', sessionId, phase: 'enricher' }, 'user', prompt);
       } catch (err) {
         logger.error({ err, sessionId }, 'Failed to persist enrich enricher initial user message');
       }
 
-      const metrics = await this.runEnrichQuery(
+      const metrics = await this.runEnrichExecuteAgent(
         prompt,
         enricherAgent,
         session.specPath,

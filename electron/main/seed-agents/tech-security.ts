@@ -23,12 +23,12 @@ export const techSecurity: Omit<AgentConfig, 'sortOrder'> = {
   thinkingBudget: 10000,
   maxTurns: 40,
   maxToolRounds: 20,
-  allowedTools: ['Read', 'Write', 'Edit', 'Glob', 'Grep'],
+  allowedTools: ['Read', 'Edit', 'Glob', 'Grep'],
   mcpServers: [],
   isActive: true,
   skills: [],
   runtime: 'cloud' as const,
-  squad: 'workflow',
+  squad: 'pipeline',
   systemPrompt: `Voce e o agente responsavel pelas decisoes de Seguranca/auth/permissoes do projeto.
 
 Seu escopo e EXCLUSIVAMENTE o dominio Seguranca/auth/permissoes. Voce NAO deve sugerir, perguntar ou alterar qualquer coisa fora desse dominio.
@@ -40,7 +40,7 @@ Converse com o usuario para tomar as decisoes tecnicas de Seguranca/auth/permiss
 Quando tiver uma decisao consolidada, edite APENAS a secao "### Security" do PRD.md (e nenhuma outra secao). Se a secao nao existir, crie-a no lugar correto.
 
 ## Ordem obrigatoria de encerramento
-1. Salve TODAS as decisoes tecnicas no PRD.md usando a ferramenta Write/Edit
+1. Salve TODAS as decisoes tecnicas no PRD.md usando a ferramenta Edit (cirurgico, preserva o resto do PRD). Se a secao "### Security" nao existir, use Edit pra adicionar ao final do arquivo. NUNCA use Write em arquivos existentes — Write sobrescreve tudo.
 2. Confirme para o usuario que o arquivo foi atualizado
 3. Somente apos salvar, instrua o usuario a clicar em Aprovar para avancar
 NUNCA peca aprovacao antes de gravar as decisoes no arquivo.

@@ -3,7 +3,7 @@ import { CronExpressionParser } from 'cron-parser';
 import crypto from 'crypto';
 import { getDb, createSession } from './db';
 import { createLogger } from './logger';
-import { executeQuery } from './orchestrator';
+import { executeBackgroundQuery } from './orchestrator';
 import { sendTelegramNotification, isTelegramConfigured } from './telegram-bridge';
 import type { ScheduledTask, TaskRun } from '../../src/types';
 
@@ -100,7 +100,7 @@ async function runTaskAsync(
     // Execute silently - messages/artifacts are saved to DB but NOT streamed to main chat.
     // User views results via "Ver Sessao" which loads from DB.
     if (getWindowFn) {
-      await executeQuery(prompt, {
+      await executeBackgroundQuery(prompt, {
         agentId: subagent || undefined,
         sessionId,
         silent: true,

@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
-import { X, Folder, Loader2, ChevronRight, ChevronLeft, FileText } from 'lucide-react';
+import { X, Folder, Loader2, ChevronRight, ChevronLeft, FileText, GitBranch, Shield, Code, Network } from 'lucide-react';
 import { usePipelineStore } from '@/stores/pipeline-store';
+import type { PipelineType } from '@/types';
 
-// ---- 4 Entry points as per spec ----
+// ---- Development entry points ----
 
 interface EntryPoint {
   phase: number;
@@ -10,21 +11,92 @@ interface EntryPoint {
   description: string;
 }
 
-const ENTRY_POINTS: EntryPoint[] = [
+const DEV_ENTRY_POINTS: EntryPoint[] = [
   {
     phase: 1,
     label: 'Discovery',
     description: 'Comecar do zero — entrevista de produto, PRD, SPEC e implementacao',
   },
   {
-    phase: 3,
-    label: 'Spec Validator + Enricher',
-    description: 'Ja tem um PRD — validar e enriquecer a SPEC antes de planejar',
+    phase: 9,
+    label: 'Spec Builder',
+    description: 'Ja tem PRD + decisoes tecnicas — gerar, validar e enriquecer a SPEC',
   },
   {
-    phase: 8,
+    phase: 11,
     label: 'Planner',
     description: 'Ja tem SPEC aprovada — gerar sprints e planejar a implementacao',
+  },
+];
+
+// ---- Security entry points ----
+
+const SECURITY_ENTRY_POINTS: EntryPoint[] = [
+  {
+    phase: 1,
+    label: 'Scan Completo',
+    description: 'Profiling + auditoria + validacao + correcao automatizada',
+  },
+  {
+    phase: 5,
+    label: 'SPEC a partir de relatorio',
+    description: 'Ja tem um Security-*.md — gerar SPEC e corrigir',
+  },
+];
+
+// ---- Feature entry points ----
+
+const FEATURE_ENTRY_POINTS: EntryPoint[] = [
+  {
+    phase: 1,
+    label: 'Feature Discovery',
+    description: 'Explorar o repo, discutir a feature, gerar PRD, SPEC e implementacao',
+  },
+];
+
+// ---- Architecture Review entry points ----
+
+const ARCHITECTURE_ENTRY_POINTS: EntryPoint[] = [
+  {
+    phase: 1,
+    label: 'Mapeamento Completo',
+    description: 'Mapeia arquitetura, escolhe alvo, diagnostica, fecha decisoes, gera SPEC e implementa',
+  },
+];
+
+// ---- Pipeline type options ----
+
+interface PipelineTypeOption {
+  type: PipelineType;
+  label: string;
+  description: string;
+  icon: React.ReactNode;
+}
+
+const PIPELINE_TYPES: PipelineTypeOption[] = [
+  {
+    type: 'development',
+    label: 'Development Pipeline',
+    description: 'Discovery, PRD, SPEC e implementacao de produto.',
+    icon: <GitBranch size={20} />,
+  },
+  {
+    type: 'security',
+    label: 'Security Audit',
+    description: 'Auditoria multi-agente de seguranca e qualidade.',
+    icon: <Shield size={20} />,
+  },
+  {
+    type: 'feature',
+    label: 'Feature Pipeline',
+    description: 'Adicionar uma feature a um projeto/repositorio existente.',
+    icon: <Code size={20} />,
+  },
+  {
+    type: 'architecture-review',
+    label: 'Architecture Review',
+    description: 'Mapeia arquitetura, escolhe alvo, fecha decisoes e gera SPEC implementavel.',
+    icon: <Network size={20} />,
   },
 ];
 
@@ -46,15 +118,18 @@ interface NewPipelineModalProps {
 export function NewPipelineModal({ onClose, onCreated }: NewPipelineModalProps) {
   const { createProject, projects } = usePipelineStore();
 
-  // Step 1: project data; Step 2: entry point
-  const [step, setStep] = useState<1 | 2>(1);
+  // Step 0: tipo de pipeline; Step 1: dados do projeto; Step 2: entry point
+  const [step, setStep] = useState<0 | 1 | 2>(0);
+
+  // Step 0 field
+  const [pipelineType, setPipelineType] = useState<PipelineType | null>(null);
 
   // Step 1 fields
   const [name, setName] = useState('');
   const [description, setDescription] = useState('');
   const [projectPath, setProjectPath] = useState('');
 
-  // Suggested candidate paths (not verified — shown as hints only)
+  // Suggested candidate paths (only for development pipeline)
   const [suggestedSpecPath, setSuggestedSpecPath] = useState<string | null>(null);
   const [suggestedPrdPath, setSuggestedPrdPath] = useState<string | null>(null);
 
@@ -68,16 +143,33 @@ export function NewPipelineModal({ onClose, onCreated }: NewPipelineModalProps) 
 
   const nameInputRef = useRef<HTMLInputElement>(null);
 
-  // Focus name on open
+  // Focus name when entering step 1
   useEffect(() => {
-    nameInputRef.current?.focus();
-  }, []);
+    if (step === 1) {
+      nameInputRef.current?.focus();
+    }
+  }, [step]);
+
+  // Reset selected phase to the first available entry point when pipeline type changes
+  useEffect(() => {
+    if (pipelineType === 'security') {
+      setSelectedPhase(SECURITY_ENTRY_POINTS[0].phase);
+    } else if (pipelineType === 'feature') {
+      setSelectedPhase(FEATURE_ENTRY_POINTS[0].phase);
+    } else if (pipelineType === 'architecture-review') {
+      setSelectedPhase(ARCHITECTURE_ENTRY_POINTS[0].phase);
+    } else {
+      setSelectedPhase(DEV_ENTRY_POINTS[0].phase);
+    }
+  }, [pipelineType]);
 
   // Derive suggested candidate paths when the project path changes.
-  // These are not verified against the filesystem — just conventional name hints.
+  // Applies to development and feature pipelines (both generate SPEC.md/PRD.md
+  // at the project root). Security uses its own folder convention.
   useEffect(() => {
     const path = projectPath.trim();
-    if (!path) {
+    const useSuggested = pipelineType === 'development' || pipelineType === 'feature';
+    if (!path || !useSuggested) {
       setSuggestedSpecPath(null);
       setSuggestedPrdPath(null);
       return;
@@ -85,7 +177,7 @@ export function NewPipelineModal({ onClose, onCreated }: NewPipelineModalProps) 
     const base = path.replace(/\/$/, '');
     setSuggestedSpecPath(`${base}/SPEC.md`);
     setSuggestedPrdPath(`${base}/PRD.md`);
-  }, [projectPath]);
+  }, [projectPath, pipelineType]);
 
   const handlePickDirectory = async () => {
     const dir = await window.lionclaw.shell.selectDirectory();
@@ -138,7 +230,13 @@ export function NewPipelineModal({ onClose, onCreated }: NewPipelineModalProps) 
     }
   }
 
-  const handleNextStep = () => {
+  const handleNextFromStep0 = () => {
+    if (pipelineType !== null) {
+      setStep(1);
+    }
+  };
+
+  const handleNextFromStep1 = () => {
     setFieldErrors(liveErrors);
     setTouched({ name: true, description: true, projectPath: true });
     if (Object.keys(liveErrors).length === 0) {
@@ -156,8 +254,13 @@ export function NewPipelineModal({ onClose, onCreated }: NewPipelineModalProps) 
         description: description.trim(),
         projectPath: projectPath.trim(),
         startPhase: selectedPhase,
-        specPath: suggestedSpecPath ?? undefined,
-        prdPath: suggestedPrdPath ?? undefined,
+        specPath: (pipelineType === 'development' || pipelineType === 'feature')
+          ? (suggestedSpecPath ?? undefined)
+          : undefined,
+        prdPath: (pipelineType === 'development' || pipelineType === 'feature')
+          ? (suggestedPrdPath ?? undefined)
+          : undefined,
+        pipelineType: pipelineType ?? 'development',
       });
 
       await onCreated(projectId, selectedPhase);
@@ -172,6 +275,23 @@ export function NewPipelineModal({ onClose, onCreated }: NewPipelineModalProps) 
     if (e.key === 'Escape') onClose();
   };
 
+  // Entry points based on pipeline type
+  const entryPoints =
+    pipelineType === 'security'
+      ? SECURITY_ENTRY_POINTS
+      : pipelineType === 'feature'
+        ? FEATURE_ENTRY_POINTS
+        : pipelineType === 'architecture-review'
+          ? ARCHITECTURE_ENTRY_POINTS
+          : DEV_ENTRY_POINTS;
+
+  // Step label for header
+  const stepLabel = step === 0
+    ? 'Tipo de pipeline (1/3)'
+    : step === 1
+      ? 'Dados do projeto (2/3)'
+      : 'Ponto de entrada (3/3)';
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm"
@@ -183,9 +303,7 @@ export function NewPipelineModal({ onClose, onCreated }: NewPipelineModalProps) 
         <div className="flex items-center justify-between px-5 py-4 border-b border-zinc-800">
           <div>
             <h2 className="text-sm font-bold text-zinc-100">Novo Pipeline</h2>
-            <p className="text-xs text-zinc-500 mt-0.5">
-              {step === 1 ? 'Dados do projeto (1/2)' : 'Ponto de entrada (2/2)'}
-            </p>
+            <p className="text-xs text-zinc-500 mt-0.5">{stepLabel}</p>
           </div>
           <button
             onClick={onClose}
@@ -197,13 +315,52 @@ export function NewPipelineModal({ onClose, onCreated }: NewPipelineModalProps) 
 
         {/* Step indicator dots */}
         <div className="flex items-center justify-center gap-2 pt-4 pb-1">
-          <div className={`w-2 h-2 rounded-full transition-colors ${step === 1 ? 'bg-amber-500' : 'bg-green-500'}`} />
+          <div className={`w-2 h-2 rounded-full transition-colors ${step === 0 ? 'bg-amber-500' : step > 0 ? 'bg-green-500' : 'bg-zinc-700'}`} />
+          <div className={`w-2 h-2 rounded-full transition-colors ${step === 1 ? 'bg-amber-500' : step > 1 ? 'bg-green-500' : 'bg-zinc-700'}`} />
           <div className={`w-2 h-2 rounded-full transition-colors ${step === 2 ? 'bg-amber-500' : 'bg-zinc-700'}`} />
         </div>
 
         {/* Body */}
         <div className="px-5 py-4 space-y-4">
-          {step === 1 ? (
+          {step === 0 ? (
+            // Step 0: pipeline type selector
+            <div className="space-y-2">
+              {PIPELINE_TYPES.map((opt) => (
+                <button
+                  key={opt.type}
+                  onClick={() => setPipelineType(opt.type)}
+                  className={`w-full text-left p-3.5 rounded-xl border transition-all ${
+                    pipelineType === opt.type
+                      ? 'bg-amber-500/10 border-amber-500/50'
+                      : 'bg-zinc-800/50 border-zinc-700 hover:border-zinc-600'
+                  }`}
+                >
+                  <div className="flex items-center gap-3">
+                    <span className={`shrink-0 ${pipelineType === opt.type ? 'text-amber-400' : 'text-zinc-500'}`}>
+                      {opt.icon}
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-semibold text-zinc-100">{opt.label}</span>
+                        <div
+                          className={`w-4 h-4 rounded-full border-2 flex items-center justify-center transition-colors ${
+                            pipelineType === opt.type
+                              ? 'border-amber-500 bg-amber-500'
+                              : 'border-zinc-600'
+                          }`}
+                        >
+                          {pipelineType === opt.type && (
+                            <div className="w-1.5 h-1.5 rounded-full bg-white" />
+                          )}
+                        </div>
+                      </div>
+                      <p className="text-[11px] text-zinc-500 mt-0.5">{opt.description}</p>
+                    </div>
+                  </div>
+                </button>
+              ))}
+            </div>
+          ) : step === 1 ? (
             <>
               {/* Name */}
               <div>
@@ -284,8 +441,8 @@ export function NewPipelineModal({ onClose, onCreated }: NewPipelineModalProps) 
                   </p>
                 )}
 
-                {/* Suggested path hints — not verified, confirmed only on project creation */}
-                {projectPath.trim() && (suggestedSpecPath || suggestedPrdPath) && (
+                {/* Suggested path hints — development pipeline only */}
+                {pipelineType === 'development' && projectPath.trim() && (suggestedSpecPath || suggestedPrdPath) && (
                   <div className="mt-2 space-y-1">
                     {suggestedSpecPath && (
                       <div className="flex items-center gap-1.5 text-[11px] text-zinc-500">
@@ -307,7 +464,7 @@ export function NewPipelineModal({ onClose, onCreated }: NewPipelineModalProps) 
             <>
               {/* Step 2: Entry point selection */}
               <div className="space-y-2">
-                {ENTRY_POINTS.map((ep) => (
+                {entryPoints.map((ep) => (
                   <button
                     key={ep.phase}
                     onClick={() => setSelectedPhase(ep.phase)}
@@ -348,7 +505,7 @@ export function NewPipelineModal({ onClose, onCreated }: NewPipelineModalProps) 
 
         {/* Footer */}
         <div className="flex justify-between gap-2 px-5 py-4 border-t border-zinc-800">
-          {step === 1 ? (
+          {step === 0 ? (
             <>
               <button
                 onClick={onClose}
@@ -357,7 +514,25 @@ export function NewPipelineModal({ onClose, onCreated }: NewPipelineModalProps) 
                 Cancelar
               </button>
               <button
-                onClick={handleNextStep}
+                onClick={handleNextFromStep0}
+                disabled={pipelineType === null}
+                className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-amber-600 hover:bg-amber-500 rounded-lg transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+              >
+                Proximo
+                <ChevronRight size={14} />
+              </button>
+            </>
+          ) : step === 1 ? (
+            <>
+              <button
+                onClick={() => setStep(0)}
+                className="flex items-center gap-1.5 px-4 py-2 text-xs font-medium text-zinc-400 hover:text-zinc-200 bg-zinc-800 hover:bg-zinc-700 rounded-lg transition-colors"
+              >
+                <ChevronLeft size={14} />
+                Voltar
+              </button>
+              <button
+                onClick={handleNextFromStep1}
                 disabled={!isStep1Valid}
                 className="flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-white bg-amber-600 hover:bg-amber-500 rounded-lg transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
               >
