@@ -601,7 +601,7 @@ function ensureBuiltinMCPServers(): void {
       id: 'local-llm',
       name: 'Local LLM',
       dir: 'local-llm',
-      envKeys: [] as string[],
+      envKeys: ['HARNESS_OPENROUTER_KEY'] as string[],
       isActive: true,
     },
     {

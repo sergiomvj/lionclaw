@@ -4,7 +4,9 @@ import { z } from 'zod';
 
 const TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes
 
-type Provider = 'ollama' | 'lmstudio' | 'openai-compatible';
+type Provider = 'ollama' | 'lmstudio' | 'openai-compatible' | 'openrouter';
+
+const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 
 async function fetchWithTimeout(url: string, options: RequestInit, timeoutMs: number = TIMEOUT_MS): Promise<Response> {
   const controller = new AbortController();
@@ -48,7 +50,7 @@ async function chatOllama(baseUrl: string, model: string, prompt: string, system
   };
 }
 
-async function chatOpenAICompatible(baseUrl: string, model: string, prompt: string, systemPrompt?: string, temperature?: number, maxTokens?: number): Promise<{ content: string; model: string; tokensUsed?: number }> {
+async function chatOpenAICompatible(baseUrl: string, model: string, prompt: string, systemPrompt?: string, temperature?: number, maxTokens?: number, apiKey?: string): Promise<{ content: string; model: string; tokensUsed?: number }> {
   const messages: Array<{ role: string; content: string }> = [];
   if (systemPrompt) messages.push({ role: 'system', content: systemPrompt });
   messages.push({ role: 'user', content: prompt });
@@ -57,9 +59,12 @@ async function chatOpenAICompatible(baseUrl: string, model: string, prompt: stri
   if (temperature !== undefined) body.temperature = temperature;
   if (maxTokens !== undefined) body.max_tokens = maxTokens;
 
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+
   const response = await fetchWithTimeout(`${baseUrl}/v1/chat/completions`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body: JSON.stringify(body),
   });
 
@@ -91,8 +96,10 @@ async function listModelsOllama(baseUrl: string): Promise<Array<{ name: string; 
   }));
 }
 
-async function listModelsOpenAI(baseUrl: string): Promise<Array<{ name: string; size: string; modified: string }>> {
-  const response = await fetchWithTimeout(`${baseUrl}/v1/models`, { method: 'GET' }, 15000);
+async function listModelsOpenAI(baseUrl: string, apiKey?: string): Promise<Array<{ name: string; size: string; modified: string }>> {
+  const headers: Record<string, string> = {};
+  if (apiKey) headers['Authorization'] = `Bearer ${apiKey}`;
+  const response = await fetchWithTimeout(`${baseUrl}/v1/models`, { method: 'GET', headers }, 15000);
   if (!response.ok) throw new Error(`API error ${response.status}`);
 
   const data = await response.json() as { data?: Array<{ id: string; created?: number }> };
@@ -120,11 +127,11 @@ const server = new McpServer({
 
 server.tool(
   'local_llm_chat',
-  'Envia um prompt para um modelo local (Ollama, LM Studio, ou OpenAI-compatible) e retorna a resposta',
+  'Envia um prompt para um modelo local ou OpenRouter e retorna a resposta. Use provider="openrouter" para acessar qualquer modelo via OpenRouter (Gemini, GPT-4o, Llama, etc) sem configurar baseUrl.',
   {
-    provider: z.enum(['ollama', 'lmstudio', 'openai-compatible']).describe('Provider do modelo local'),
-    baseUrl: z.string().describe('URL base do provider (ex: http://localhost:11434)'),
-    model: z.string().describe('Nome do modelo (ex: llama3:8b, mistral, deepseek-coder)'),
+    provider: z.enum(['ollama', 'lmstudio', 'openai-compatible', 'openrouter']).describe('Provider: "openrouter" para OpenRouter (recomendado), "ollama"/"lmstudio"/"openai-compatible" para modelos locais'),
+    baseUrl: z.string().optional().describe('URL base do provider. Obrigatório para ollama/lmstudio/openai-compatible. Ignorado para openrouter.'),
+    model: z.string().describe('Modelo (ex: "google/gemini-2.5-pro", "meta-llama/llama-3.1-405b-instruct" para OpenRouter; "llama3:8b" para Ollama)'),
     prompt: z.string().describe('Prompt/mensagem para enviar ao modelo'),
     systemPrompt: z.string().optional().describe('System prompt opcional'),
     temperature: z.number().min(0).max(2).optional().describe('Temperature (0-2, default 0.7)'),
@@ -135,9 +142,13 @@ server.tool(
       let result: { content: string; model: string; tokensUsed?: number };
 
       if (provider === 'ollama') {
-        result = await chatOllama(baseUrl, model, prompt, systemPrompt, temperature, maxTokens);
+        result = await chatOllama(baseUrl!, model, prompt, systemPrompt, temperature, maxTokens);
+      } else if (provider === 'openrouter') {
+        const apiKey = process.env.HARNESS_OPENROUTER_KEY;
+        if (!apiKey) throw new Error('HARNESS_OPENROUTER_KEY não encontrada. Configure a chave OpenRouter no Vault do LionClaw.');
+        result = await chatOpenAICompatible(OPENROUTER_BASE_URL, model, prompt, systemPrompt, temperature, maxTokens, apiKey);
       } else {
-        result = await chatOpenAICompatible(baseUrl, model, prompt, systemPrompt, temperature, maxTokens);
+        result = await chatOpenAICompatible(baseUrl!, model, prompt, systemPrompt, temperature, maxTokens);
       }
 
       return {
@@ -161,19 +172,23 @@ server.tool(
 
 server.tool(
   'local_llm_list_models',
-  'Lista modelos disponiveis no provider local',
+  'Lista modelos disponiveis no provider. Use provider="openrouter" para listar modelos disponíveis no OpenRouter.',
   {
-    provider: z.enum(['ollama', 'lmstudio', 'openai-compatible']).describe('Provider do modelo local'),
-    baseUrl: z.string().describe('URL base do provider'),
+    provider: z.enum(['ollama', 'lmstudio', 'openai-compatible', 'openrouter']).describe('Provider'),
+    baseUrl: z.string().optional().describe('URL base do provider. Ignorado para openrouter.'),
   },
   async ({ provider, baseUrl }) => {
     try {
       let models: Array<{ name: string; size: string; modified: string }>;
 
       if (provider === 'ollama') {
-        models = await listModelsOllama(baseUrl);
+        models = await listModelsOllama(baseUrl!);
+      } else if (provider === 'openrouter') {
+        const apiKey = process.env.HARNESS_OPENROUTER_KEY;
+        if (!apiKey) throw new Error('HARNESS_OPENROUTER_KEY não encontrada.');
+        models = await listModelsOpenAI(OPENROUTER_BASE_URL, apiKey);
       } else {
-        models = await listModelsOpenAI(baseUrl);
+        models = await listModelsOpenAI(baseUrl!);
       }
 
       return {
